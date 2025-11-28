@@ -185,6 +185,56 @@ public:
     }
 };
 
+class MaxPool2x2 {
+private: 
+    Shape inputShape_;
+    std::vector<int> maxIndices_;
+
+public: 
+    Tensor forward(Tensor &input) {
+        inputShape_ = { input.n, input.c, input.h, input.w };
+        const int outH = input.h / 2;
+        const int outW = input.w / 2;
+        Tensor output(input.n, input.c, outH, outW);
+        maxIndices_.resize(output.elements(), -1);
+
+        for (int n = 0; n < input.n; n++) {
+            for (int c = 0; c < input.c; c++) {
+                for (int h = 0; h < outH; h++) {
+                    for (int w = 0; w < outW; w++) {
+                        float maxVal = -std::numeric_limits<float>::infinity();
+                        int maxIdx = -1;
+                        for (int kh = 0; kh < 2; kh++) {
+                            for (int kw = 0; kw < 2; kw++) {
+                                int inH = h * 2 + kh;
+                                int inW = w * 2 + kw;
+                                float val = input(n, c, inH, inW);
+                                if (val > maxVal) {
+                                    maxVal = val;
+                                    maxIdx = input.index(n, c, inH, inW);
+                                }
+                            }
+                        }
+                        output(n, c, h, w) = maxVal;
+                        maxIndices_[output.index(n, c, h, w)] = maxIdx;
+                    }
+                }
+            }
+        }
+        return output;
+    }
+
+    Tensor backward(Tensor &output) {
+        Tensor input = output;
+        for (size_t i = 0; i < output.elements(); i++) {
+            if (maxIndices_[i] != -1) {
+                input.data[maxIndices_[i]] = output.data[i];
+            }
+        }
+        return input;
+    }
+};
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " <cifar_root> [epochs] [batch_size] [learning_rate]\n";
