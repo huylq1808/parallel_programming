@@ -160,6 +160,31 @@ private:
     }
 };
 
+class ReLU {
+private: 
+    std::vector<size_t> mask_;
+public: 
+    Tensor forward(Tensor &input) {
+        mask_.assign(input.elements(), 0);
+        Tensor output = input; 
+        for (size_t i = 0; i < input.elements(); i++) {
+            if (input.data[i] > 0) 
+                mask_[i] = 1;
+            else 
+                output.data[i] = 0;
+        }
+        return output;
+    }
+
+    Tensor backward(Tensor &output) {
+        Tensor input = output;
+        for (size_t i = 0; i < output.elements(); i++) {
+            input.data[i] *= static_cast<float>(mask_[i]);
+        }
+        return input;
+    }
+};
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " <cifar_root> [epochs] [batch_size] [learning_rate]\n";
