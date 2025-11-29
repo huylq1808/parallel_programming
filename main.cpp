@@ -5,6 +5,18 @@
 #include <random>
 #include <numeric>
 #include <algorithm>
+#include <chrono>
+
+struct CpuTimer {
+    std::chrono::steady_clock::time_point start_;
+    
+    void start() { start_ = std::chrono::steady_clock::now(); }
+    
+    double elapsedMs() const {
+        auto now = std::chrono::steady_clock::now();
+        return std::chrono::duration<double, std::milli>(now - start_).count();
+    }
+};
 
 struct Shape {
     int n = 0; // batch size
@@ -124,7 +136,7 @@ private:
     void loadSplit(const std::filesystem::path &root, Split split) {
         std::vector<std::filesystem::path> files;
         if (split == Split::Train) {
-            for (int i = 1; i <= 5; i++) {
+            for (int i = 1; i <= 1; i++) {
                 files.emplace_back(root / ("data_batch_" + std::to_string(i) + ".bin"));
             }
         }
@@ -225,7 +237,8 @@ public:
     }
 
     Tensor backward(Tensor &output) {
-        Tensor input = output;
+        Tensor input(inputShape_.n, inputShape_.c, inputShape_.h, inputShape_.w);
+        input.fill(0.0f);
         for (size_t i = 0; i < output.elements(); i++) {
             if (maxIndices_[i] != -1) {
                 input.data[maxIndices_[i]] = output.data[i];
@@ -345,7 +358,7 @@ public:
         input.fill(0.0f);
         std::fill(gradWeights_.begin(), gradWeights_.end(), 0.0f);
         std::fill(gradBias_.begin(), gradBias_.end(), 0.0f);
-        
+
         for(int n = 0; n < output.n; n++) {  
             for(int oc = 0; oc < output.c; oc++) {
                 for(int h = 0; h < output.h; h++) {
@@ -382,6 +395,53 @@ public:
     }
 };
 
+class Flatten {
+private: 
+    Shape inputShape_;
+    Tensor output_; 
+public: 
+    Tensor forward(Tensor &input) {
+        inputShape_ = { input.n, input.c, input.h, input.w };
+        Tensor output(input.n, input.c * input.h * input.w, 1, 1);
+        output.data = input.data; 
+        output_ = output;
+        return output;
+    }
+
+    Tensor backward(Tensor &output) {
+        Tensor input(inputShape_.n, inputShape_.c, inputShape_.h, inputShape_.w);
+        input.data = output.data;
+        return input;
+    }
+
+    const Tensor &output() const {
+        return output_;
+    }
+};
+
+class Reshape {
+private: 
+    Shape target_;
+    Shape lastShape_;
+public: 
+    Reshape(int channels, int height, int width) : target_({ 0, channels, height, width }) {}
+    Tensor forward(Tensor &input) {
+        lastShape_ = { input.n, input.c, input.h, input.w };
+        Tensor output(input.n, target_.c, target_.h, target_.w);
+        if(input.elements() != output.elements())
+            throw std::runtime_error("Reshape: input and output size mismatch");
+        output.data = input.data;
+        return output;
+    }   
+
+    Tensor backward(Tensor &output) {
+        Tensor input(lastShape_.n, lastShape_.c, lastShape_.h, lastShape_.w);
+        if(input.elements() != output.elements())
+            throw std::runtime_error("Reshape: input and output size mismatch");
+        input.data = output.data;
+        return input;
+    }
+};
 
 class MSE {
 private: 
@@ -402,11 +462,172 @@ public:
         return loss / static_cast<float>(count);
     }
 
-    Tensor backward() {
+    const Tensor &backward() const {
         return grad;
     }
 };
 
+class Sigmoid {
+private:
+    Tensor outputCache_;
+
+public:
+    Tensor forward(Tensor &input) {
+        outputCache_ = input;
+        for (auto &val : outputCache_.data) {
+            val = 1.0f / (1.0f + std::exp(-val));
+        }
+        return outputCache_;
+    }
+
+    Tensor backward(const Tensor &output) {
+        Tensor input = output;
+        for (size_t i = 0; i < input.elements(); i++) {
+            float sig = outputCache_.data[i];
+            input.data[i] *= sig * (1.0f - sig);
+        }
+        return input;
+    }
+};
+
+class Autoencoder {
+private:
+    Conv2D conv1_;
+    Conv2D conv2_;
+    Conv2D conv3_;
+    Conv2D conv4_;
+    ReLU relu1_;
+    ReLU relu2_;
+    ReLU relu3_;
+    MaxPool2x2 pool_;
+    Upsample2x2 upsample_;
+    Flatten flatten_;
+    Reshape reshape_;
+    Sigmoid sigmoid_;
+    Tensor latent_;
+    Tensor lastReconstruction_;
+
+    Tensor runEncoder(Tensor &input) {
+        Tensor x = conv1_.forward(input); 
+        x = relu1_.forward(x);
+        x = conv2_.forward(x);
+        x = relu2_.forward(x);
+        x = pool_.forward(x);
+        x = flatten_.forward(x);
+        latent_ = x;
+        return x;
+    }
+
+public:
+    Autoencoder(): 
+        conv1_(3, 32, 3, 1),
+        conv2_(32, 32, 3, 1),
+        conv3_(32, 32, 3, 1),
+        conv4_(32, 3, 3, 1),
+        reshape_(32, 16, 16),
+        sigmoid_() {}
+
+    Tensor forward(Tensor &input) {
+        Tensor latent = runEncoder(input);
+        Tensor x = reshape_.forward(latent);
+        x = upsample_.forward(x);
+        x = conv3_.forward(x);
+        x = relu3_.forward(x);
+        x = conv4_.forward(x);
+        x = sigmoid_.forward(x);
+        lastReconstruction_ = x;
+        return lastReconstruction_;
+    }
+
+    void backward(const Tensor &output, float learningRate) {
+        Tensor grad = sigmoid_.backward(output);
+        grad = conv4_.backward(grad, learningRate);
+        grad = relu3_.backward(grad);
+        grad = conv3_.backward(grad, learningRate);
+        grad = upsample_.backward(grad);
+        grad = reshape_.backward(grad);
+        grad = flatten_.backward(grad);
+        grad = pool_.backward(grad);
+        grad = relu2_.backward(grad);
+        grad = conv2_.backward(grad, learningRate);
+        grad = relu1_.backward(grad);
+        (void)conv1_.backward(grad, learningRate);
+    }
+
+    Tensor encodeBatch(Tensor &input) {
+        return runEncoder(input);
+    }
+
+    const Tensor &latentCache() const {
+        return latent_;
+    }
+
+};
+
+struct TrainConfig {
+    int epochs = 20;
+    int batchSize = 32;
+    float learningRate = 1e-3f;
+    int logEvery = 50;
+};
+
+struct EpochStats {
+    float loss;
+    double epochTimeMs;
+    double imagesPerSec;
+    size_t samplesProcessed;
+};
+
+EpochStats runEpoch(Autoencoder &model, CifarDataLoader &loader, int batchSize, float learningRate, int logEvery) {
+    MSE loss;
+    loader.startEpoch(true);
+    const size_t steps = (loader.numSamples() + static_cast<size_t>(batchSize) - 1) / batchSize;
+    double accumLoss = 0.0;
+    size_t seenSamples = 0;
+    const int safeLogEvery = std::max(1, logEvery);
+
+    CpuTimer epochTimer;
+    epochTimer.start();
+
+    for (size_t step = 0; step < steps; step++) {
+        Batch batch = loader.nextBatch(batchSize);
+        Tensor recon = model.forward(batch.images);
+        float batchLoss = loss.forward(recon, batch.images);
+        model.backward(loss.backward(), learningRate);
+        accumLoss += static_cast<double>(batchLoss) * batch.images.n;
+        seenSamples += batch.images.n;
+
+        if (((step + 1) % safeLogEvery) == 0 || step == 0 || step + 1 == steps) {
+            std::cout << "    batch " << (step + 1) << "/" << steps
+                      << " mse=" << std::fixed << std::setprecision(6) << batchLoss << "\n";
+        }
+    }
+
+    double epochMs = epochTimer.elapsedMs();
+    double imagesPerSec = seenSamples / (epochMs / 1000.0);
+
+    return EpochStats{
+        static_cast<float>(accumLoss / seenSamples),
+        epochMs,
+        imagesPerSec,
+        seenSamples};
+}
+
+float evaluate(Autoencoder &model, CifarDataLoader &loader, int batchSize) {
+    MSE loss;
+    loader.startEpoch(false);
+    const size_t steps = (loader.numSamples() + static_cast<size_t>(batchSize) - 1) / batchSize;
+    double accumLoss = 0.0;
+    size_t seenSamples = 0;
+    for (size_t step = 0; step < steps; step++) {
+        Batch batch = loader.nextBatch(batchSize);
+        Tensor recon = model.forward(batch.images);
+        float batchLoss = loss.forward(recon, batch.images);
+        accumLoss += static_cast<double>(batchLoss) * batch.images.n;
+        seenSamples += batch.images.n;
+    }
+    return static_cast<float>(accumLoss / static_cast<double>(seenSamples));
+}
 
 int main(int argc, char **argv) {
     if (argc < 2) {
@@ -417,6 +638,56 @@ int main(int argc, char **argv) {
     const std::filesystem::path cifarRoot = argv[1];
     if (!std::filesystem::exists(cifarRoot)) {
         std::cerr << "Dataset folder not found: " << cifarRoot << "\n";
+        return 1;
+    }
+
+    TrainConfig config; 
+    if (argc > 2) config.epochs = std::stoi(argv[2]);
+    if (argc > 3) config.batchSize = std::stoi(argv[3]);
+    if (argc > 4) config.learningRate = std::stof(argv[4]);
+
+    try {
+        std::cout << "Loading CIFAR-10 from " << cifarRoot << "\n";
+        CifarDataLoader trainLoader(cifarRoot, CifarDataLoader::Split::Train);
+        CifarDataLoader testLoader(cifarRoot, CifarDataLoader::Split::Test);
+        std::cout << "Train samples: " << trainLoader.numSamples() << ", Test samples: " << testLoader.numSamples() << "\n";
+
+        Autoencoder model; 
+        double totalTrainTime = 0;
+        std::vector<EpochStats> epochStats;
+        
+        std::cout << "\n========== CPU BASELINE TRAINING ==========\n";
+        std::cout << "Hyperparameters:\n";
+        std::cout << "Batch size:     " << config.batchSize << "\n";
+        std::cout << "Epochs:         " << config.epochs << "\n";
+        std::cout << "Learning rate:  " << config.learningRate << "\n";
+        std::cout << "Train samples:  " << trainLoader.numSamples() << "\n";
+        std::cout << "Test samples:   " << testLoader.numSamples() << "\n";
+        std::cout << "=============================================\n\n";
+        
+        for (int epoch = 1; epoch <= config.epochs; epoch++) {
+            std::cout << "Epoch " << epoch << "/" << config.epochs << "\n";
+            EpochStats stats = runEpoch(model, trainLoader, config.batchSize, config.learningRate, config.logEvery);
+            float valLoss = evaluate(model, testLoader, config.batchSize);
+            
+            totalTrainTime += stats.epochTimeMs;
+            epochStats.push_back(stats);
+            
+            std::cout << std::fixed << std::setprecision(6) << "train_loss=" << stats.loss << " " << "val_loss=" << valLoss << "\n";
+            std::cout << std::fixed << std::setprecision(2) << "epoch_time=" << stats.epochTimeMs << " ms " << "throughput=" << stats.imagesPerSec << " img/s\n\n";
+        }
+
+        std::cout << "========== CPU BASELINE SUMMARY ==========\n";
+        std::cout << std::fixed << std::setprecision(2);
+        std::cout << "Total training time:    " << totalTrainTime / 1000.0 << " seconds\n";
+        std::cout << "Average epoch time:     " << totalTrainTime / config.epochs << " ms\n";
+        std::cout << "Average throughput:     " << (trainLoader.numSamples() * config.epochs) / (totalTrainTime / 1000.0) << " img/s\n";
+        std::cout << "Final train loss:       " << std::setprecision(6) << epochStats.back().loss << "\n";
+        std::cout << "==========================================\n";
+    }
+
+    catch (const std::exception &e) {
+        std::cerr << "Error: " << e.what() << "\n";
         return 1;
     }
 
