@@ -235,6 +235,179 @@ public:
     }
 };
 
+class Upsample2x2 {
+private: 
+    Shape inputShape_;
+public: 
+    Tensor forward(Tensor &input) {
+        inputShape_ = { input.n, input.c, input.h, input.w };
+        Tensor output(input.n, input.c, input.h * 2, input.w * 2);
+        for(int n = 0; n < input.n; n++) {  
+            for(int c = 0; c < input.c; c++) {
+                for(int h = 0; h < input.h; h++) {
+                    for(int w = 0; w < input.w; w++) {
+                        float val = input(n, c, h, w);
+                        for(int kh = 0; kh < 2; kh++) {
+                            for(int kw = 0; kw < 2; kw++) {
+                                output(n, c, h * 2 + kh, w * 2 + kw) = val;
+                            }
+                        }
+                    }
+                }
+            }   
+        }   
+        return output;
+    }
+
+    Tensor backward(Tensor &output) {
+        Tensor input(inputShape_.n, inputShape_.c, inputShape_.h, inputShape_.w);
+        input.fill(0.0f);
+        for(int n = 0; n < output.n; n++) {  
+            for(int c = 0; c < output.c; c++) {
+                for(int h = 0; h < output.h; h++) {
+                    for(int w = 0; w < output.w; w++) {
+                        input(n, c, h / 2, w / 2) += output(n, c, h, w);
+                    }
+                }
+            }
+        }
+        return input;
+    }
+};  
+
+class Conv2D {
+private: 
+    int inChannels_; 
+    int outChannels_; 
+    int kernelSize_; 
+    int padding_; 
+    std::vector<float> weights_;
+    std::vector<float> bias_;
+    std::vector<float> gradWeights_;
+    std::vector<float> gradBias_;
+    Tensor lastInput_;
+
+    size_t weightIndex(int oc, int ic, int ky, int kx) {
+        const size_t strideC = static_cast<size_t>(kernelSize_) * kernelSize_;
+        const size_t strideIC = static_cast<size_t>(inChannels_) * strideC;
+        return static_cast<size_t>(oc) * strideIC + static_cast<size_t>(ic) * strideC + static_cast<size_t>(ky) * kernelSize_ + kx;
+    }
+
+public: 
+    Conv2D(int inChannels, int outChannels, int kernelSize, int padding) : inChannels_(inChannels), outChannels_(outChannels), kernelSize_(kernelSize), padding_(padding) {
+        size_t count = static_cast<size_t>(outChannels_) * inChannels_ * kernelSize_ * kernelSize_;
+        weights_.resize(count);
+        bias_.assign(outChannels_, 0.0f);
+        gradWeights_.resize(count);
+        gradBias_.assign(outChannels_, 0.0f);
+        lastInput_.resize(inChannels_, inChannels_, kernelSize_, kernelSize_);
+        std::mt19937 rng(inChannels_ * 20 + outChannels_ * 25);\
+
+        // https://www.geeksforgeeks.org/deep-learning/xavier-initialization/
+        const float limit = std::sqrt(6.0f / (inChannels_ * kernelSize_ * kernelSize_ + outChannels_ * kernelSize_ * kernelSize_));
+        std::uniform_real_distribution<float> dist(-limit, limit);
+        for (auto &w : weights_)
+            w = dist(rng);
+    }
+
+    Tensor forward(Tensor &input) {
+        lastInput_ = input;
+        Tensor output(input.n, outChannels_, input.h, input.w);
+
+        for(int n = 0; n < input.n; n++) {  
+            for(int oc = 0; oc < outChannels_; oc++) {
+                for(int h = 0; h < output.h; h++) {
+                    for(int w = 0; w < output.w; w++) {
+                        float sum = bias_[oc];
+                        for(int ic = 0; ic < inChannels_; ic++) {
+                            for(int kh = 0; kh < kernelSize_; kh++) {
+                                for(int kw = 0; kw < kernelSize_; kw++) {
+                                    int inY = h + kh - padding_; 
+                                    int inX = w + kw - padding_;
+                                    if(inY < 0 || inY >= input.h || inX < 0 || inX >= input.w)
+                                        continue;
+                                    float inVal = input(n, ic, inY, inX);
+                                    float wVal = weights_[weightIndex(oc, ic, kh, kw)];
+                                    sum += inVal * wVal;
+                                }
+                            }
+                        }
+                        output(n, oc, h, w) = sum;
+                    }
+                }
+            }
+        }
+        return output;
+    }
+
+    Tensor backward(Tensor &output, float learningRate) {
+        Tensor input(lastInput_.n, lastInput_.c, lastInput_.h, lastInput_.w);
+        input.fill(0.0f);
+        std::fill(gradWeights_.begin(), gradWeights_.end(), 0.0f);
+        std::fill(gradBias_.begin(), gradBias_.end(), 0.0f);
+        
+        for(int n = 0; n < output.n; n++) {  
+            for(int oc = 0; oc < output.c; oc++) {
+                for(int h = 0; h < output.h; h++) {
+                    for(int w = 0; w < output.w; w++) {
+                        float grad = output(n, oc, h, w);
+                        gradBias_[oc] += grad;
+                        for(int ic = 0; ic < inChannels_; ic++) {
+                            for(int kh = 0; kh < kernelSize_; kh++) {
+                                for(int kw = 0; kw < kernelSize_; kw++) {
+                                    int inY = h + kh - padding_;
+                                    int inX = w + kw - padding_;
+                                    if(inY < 0 || inY >= input.h || inX < 0 || inX >= input.w)
+                                        continue;
+                                    float inVal = lastInput_(n, ic, inY, inX);
+                                    size_t wIdx = weightIndex(oc, ic, kh, kw);
+                                    gradWeights_[wIdx] += inVal * grad;
+                                    input(n, ic, inY, inX) += weights_[wIdx] * grad;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        const float scale = 1.0f / static_cast<float>(output.n);
+        for (size_t i = 0; i < weights_.size(); i++) {
+            weights_[i] -= learningRate * gradWeights_[i] * scale;
+        }
+        for (int oc = 0; oc < outChannels_; oc++) {
+            bias_[oc] -= learningRate * gradBias_[oc] * scale;
+        }
+        return input;
+    }
+};
+
+
+class MSE {
+private: 
+    Tensor grad; 
+public: 
+    float forward(Tensor &input, Tensor &target) {
+        if (input.elements() != target.elements())
+            throw std::runtime_error("MSE: input and target size mismatch");
+
+        grad.resize(input.n, input.c, input.h, input.w);
+        float loss = 0.0f;
+        size_t count = input.elements();
+        for (size_t i = 0; i < count; i++) {
+            float diff = input.data[i] - target.data[i];
+            loss += diff * diff;
+            grad.data[i] = 2.0f * diff / static_cast<float>(count);
+        }
+        return loss / static_cast<float>(count);
+    }
+
+    Tensor backward() {
+        return grad;
+    }
+};
+
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " <cifar_root> [epochs] [batch_size] [learning_rate]\n";
