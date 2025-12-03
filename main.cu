@@ -357,6 +357,156 @@ __global__ void MSELossForward(const float* __restrict__ prediction, const float
     gradOutput[idx] = (2.0f / static_cast<float>(size)) * diff;
 }
 
+__global__ void conv2dForwardKernel(const float *__restrict__ input, const float *__restrict__ weights, const float *__restrict__ bias, float *__restrict__ output, int N, int inC, int outC, int H, int W, int kSize, int padding)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int n_oc = blockIdx.z;
+
+    int n = n_oc / outC;
+    int oc = n_oc % outC;
+
+    if (x >= W || y >= H || n >= N)
+        return;
+
+    float sum = bias[oc];
+
+    for (int ic = 0; ic < inC; ic++) {
+        for (int kh = 0; kh < kSize; kh++) {
+            for (int kw = 0; kw < kSize; kw++) {
+                int inY = y + kh - padding;
+                int inX = x + kw - padding;
+
+                if (inY >= 0 && inY < H && inX >= 0 && inX < W) {
+                    int inIdx = ((n * inC + ic) * H + inY) * W + inX;
+                    int wIdx = ((oc * inC + ic) * kSize + kh) * kSize + kw;
+                    sum += input[inIdx] * weights[wIdx];
+                }
+            }
+        }
+    }
+
+    int outIdx = ((n * outC + oc) * H + y) * W + x;
+    output[outIdx] = sum;
+}
+
+__global__ void conv2dBackwardInputKernel(const float *__restrict__ gradOutput, const float *__restrict__ weights, float *__restrict__ gradInput, int N, int inC, int outC, int H, int W, int kSize, int padding) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int n_oc = blockIdx.z;
+
+    int n = n_oc / inC;
+    int ic = n_oc % inC;
+
+    if (x >= W || y >= H || n >= N)
+        return;
+
+    float sum = 0.0f;
+
+    for (int oc = 0; oc < outC; oc++) {
+        for (int kh = 0; kh < kSize; kh++) {
+            for (int kw = 0; kw < kSize; kw++) {
+                int outY = y - kh + padding;
+                int outX = x - kw + padding;
+
+                if (outY >= 0 && outY < H && outX >= 0 && outX < W) {
+                    int gradOutIdx = ((n * outC + oc) * H + outY) * W + outX;
+                    int wIdx = ((oc * inC + ic) * kSize + kh) * kSize + kw;
+                    sum += gradOutput[gradOutIdx] * weights[wIdx];
+                }
+            }
+        }
+    }
+
+    int inIdx = ((n * inC + ic) * H + y) * W + x;
+    gradInput[inIdx] = sum;
+}
+
+__global__ void conv2dBackwardWeightsKernel(const float *__restrict__ input, const float *__restrict__ gradOutput, float *__restrict__ gradWeights, int N, int inC, int outC, int H, int W, int kSize, int padding) {
+    int oc = blockIdx.x;
+    int ic = blockIdx.y;
+    int k_idx = blockIdx.z;
+
+    if (oc >= outC || ic >= inC || k_idx >= kSize * kSize)
+        return;
+
+    int kh = k_idx / kSize;
+    int kw = k_idx % kSize;
+
+    float gradW = 0.0f;
+
+    for (int n = 0; n < N; n++) {
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++){
+                int inY = y + kh - padding;
+                int inX = x + kw - padding;
+
+                if (inY >= 0 && inY < H && inX >= 0 && inX < W) {
+                    int inIdx = ((n * inC + ic) * H + inY) * W + inX;
+                    int gradOutIdx = ((n * outC + oc) * H + y) * W + x;
+                    gradW += input[inIdx] * gradOutput[gradOutIdx];
+                }
+            }
+        }
+    }
+
+    int wIdx = ((oc * inC + ic) * kSize + kh) * kSize + kw;
+    atomicAdd(&gradWeights[wIdx], gradW);
+}
+
+__global__ void conv2dBackwardBiasKernel(const float *__restrict__ gradOutput, float *__restrict__ gradBias, int N, int outC, int H, int W) {
+    int oc = blockIdx.x * blockDim.x + threadIdx.x;
+    if (oc >= outC)
+        return;
+
+    float sum = 0.0f;
+    for (int n = 0; n < N; n++) {
+        for (int y = 0; y < H; y++) { 
+            for (int x = 0; x < W; x++){
+                int idx = ((n * outC + oc) * H + y) * W + x;
+                sum += gradOutput[idx];
+            }
+        }
+    }
+
+    gradBias[oc] = sum;
+}
+
+__global__ void sgdUpdateKernel(float *__restrict__ weights, const float *__restrict__ gradients, float learningRate, float scale, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size)
+        return;
+
+    weights[idx] -= learningRate * gradients[idx] * scale;
+}
+
+__global__ void zeroMemoryKernel(float *data, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size)
+        return;
+    data[idx] = 0.0f;
+}
+
+__global__ void sumReductionKernel(const float *__restrict__ input, float *__restrict__ output, int size) {
+    extern __shared__ float sdata[];
+
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    sdata[tid] = (idx < size) ? input[idx] : 0.0f;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s)
+            sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+
+    if (tid == 0)
+        atomicAdd(output, sdata[0]);
+}
+
 // struct TrainConfig {
 //     int epochs = 10;
 //     int batchSize = 64;
@@ -367,7 +517,7 @@ __global__ void MSELossForward(const float* __restrict__ prediction, const float
 void printDeviceInfo() {
     cudaDeviceProp prop;
     CHECK(cudaGetDeviceProperties(&prop, 0));
-    
+
     std::cout << "========== GPU INFO ==========\n";
     std::cout << "Device: " << prop.name << "\n";
     std::cout << "Compute capability: " << prop.major << "." << prop.minor << "\n";
@@ -376,7 +526,6 @@ void printDeviceInfo() {
     std::cout << "Shared memory/block: " << prop.sharedMemPerBlock / 1024 << " KB\n";
     std::cout << "==============================\n\n";
 }
-
 
 void testReLU() {
     std::cout << "=== Testing ReLU ===\n";
@@ -512,13 +661,193 @@ void testSigmoid() {
     cudaFree(d_output);
 }
 
+void testConv2DForward() {
+    std::cout << "=== Testing Conv2D Forward ===\n";
+    
+    // Simple: N=1, inC=1, outC=1, H=4, W=4, kernel=3x3, padding=1
+    const int N = 1, inC = 1, outC = 1, H = 4, W = 4, kSize = 3, padding = 1;
+    const int inSize = N * inC * H * W;
+    const int outSize = N * outC * H * W;
+    const int wSize = outC * inC * kSize * kSize;
+    
+    std::vector<float> h_input = {
+        1, 2, 3, 4,
+        5, 6, 7, 8,
+        9, 10, 11, 12,
+        13, 14, 15, 16
+    };
+    std::vector<float> h_weights(wSize, 1.0f / 9.0f);  // Average filter
+    std::vector<float> h_bias = {0.0f};
+    std::vector<float> h_output(outSize);
+    
+    float *d_input, *d_weights, *d_bias, *d_output;
+    CHECK(cudaMalloc(&d_input, inSize * sizeof(float)));
+    CHECK(cudaMalloc(&d_weights, wSize * sizeof(float)));
+    CHECK(cudaMalloc(&d_bias, outC * sizeof(float)));
+    CHECK(cudaMalloc(&d_output, outSize * sizeof(float)));
+    
+    CHECK(cudaMemcpy(d_input, h_input.data(), inSize * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(d_weights, h_weights.data(), wSize * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(d_bias, h_bias.data(), outC * sizeof(float), cudaMemcpyHostToDevice));
+    
+    dim3 block(16, 16);
+    dim3 grid((W + 15) / 16, (H + 15) / 16, N * outC);
+    conv2dForwardKernel<<<grid, block>>>(d_input, d_weights, d_bias, d_output, N, inC, outC, H, W, kSize, padding);
+    CHECK(cudaGetLastError());
+    CHECK(cudaDeviceSynchronize());
+    
+    CHECK(cudaMemcpy(h_output.data(), d_output, outSize * sizeof(float), cudaMemcpyDeviceToHost));
+    
+    std::cout << "Input (4x4):\n";
+    for (int i = 0; i < H; i++) {
+        for (int j = 0; j < W; j++)
+            printf("%.1f\t", h_input[i * W + j]);
+        std::cout << "\n";
+    }
+    
+    std::cout << "Output (3x3 avg filter, padding=1):\n";
+    for (int i = 0; i < H; i++) {
+        for (int j = 0; j < W; j++)
+            printf("%.2f\t", h_output[i * W + j]);
+        std::cout << "\n";
+    }
+    std::cout << "\n";
+    
+    cudaFree(d_input);
+    cudaFree(d_weights);
+    cudaFree(d_bias);
+    cudaFree(d_output);
+}
+
+void testUpsample2x2() {
+    std::cout << "=== Testing Upsample2x2 ===\n";
+    
+    const int N = 1, C = 1, inH = 2, inW = 2;
+    const int outH = inH * 2, outW = inW * 2;
+    const int inSize = N * C * inH * inW;
+    const int outSize = N * C * outH * outW;
+    
+    std::vector<float> h_input = {1, 2, 3, 4};
+    std::vector<float> h_output(outSize);
+    
+    float *d_input, *d_output;
+    CHECK(cudaMalloc(&d_input, inSize * sizeof(float)));
+    CHECK(cudaMalloc(&d_output, outSize * sizeof(float)));
+    
+    CHECK(cudaMemcpy(d_input, h_input.data(), inSize * sizeof(float), cudaMemcpyHostToDevice));
+    
+    dim3 block(16, 16);
+    dim3 grid((outW + 15) / 16, (outH + 15) / 16, N * C);
+    Upsample2x2Forward<<<grid, block>>>(d_input, d_output, N, C, inH, inW);
+    CHECK(cudaGetLastError());
+    CHECK(cudaDeviceSynchronize());
+    
+    CHECK(cudaMemcpy(h_output.data(), d_output, outSize * sizeof(float), cudaMemcpyDeviceToHost));
+    
+    std::cout << "Input (2x2):\n";
+    for (int i = 0; i < inH; i++) {
+        for (int j = 0; j < inW; j++)
+            std::cout << h_input[i * inW + j] << "\t";
+        std::cout << "\n";
+    }
+    
+    std::cout << "Output (4x4 upsampled):\n";
+    for (int i = 0; i < outH; i++) {
+        for (int j = 0; j < outW; j++)
+            std::cout << h_output[i * outW + j] << "\t";
+        std::cout << "\n";
+    }
+    std::cout << "\n";
+    
+    cudaFree(d_input);
+    cudaFree(d_output);
+}
+
+void testSumReduction() {
+    std::cout << "=== Testing Sum Reduction ===\n";
+    
+    const int size = 1024;
+    std::vector<float> h_input(size);
+    for (int i = 0; i < size; i++) h_input[i] = 1.0f;  // Sum should be 1024
+    
+    float h_output = 0.0f;
+    
+    float *d_input, *d_output;
+    CHECK(cudaMalloc(&d_input, size * sizeof(float)));
+    CHECK(cudaMalloc(&d_output, sizeof(float)));
+    CHECK(cudaMemset(d_output, 0, sizeof(float)));
+    
+    CHECK(cudaMemcpy(d_input, h_input.data(), size * sizeof(float), cudaMemcpyHostToDevice));
+    
+    int blockSize = 256;
+    int gridSize = (size + blockSize - 1) / blockSize;
+    sumReductionKernel<<<gridSize, blockSize, blockSize * sizeof(float)>>>(d_input, d_output, size);
+    CHECK(cudaGetLastError());
+    CHECK(cudaDeviceSynchronize());
+    
+    CHECK(cudaMemcpy(&h_output, d_output, sizeof(float), cudaMemcpyDeviceToHost));
+    
+    std::cout << "Sum of " << size << " ones = " << h_output << " (expected: " << size << ")\n\n";
+    
+    cudaFree(d_input);
+    cudaFree(d_output);
+}
+
+void testMSELoss() {
+    std::cout << "=== Testing MSE Loss ===\n";
+    
+    const int size = 4;
+    std::vector<float> h_pred = {1.0f, 2.0f, 3.0f, 4.0f};
+    std::vector<float> h_target = {1.5f, 2.5f, 3.5f, 4.5f};  // All off by 0.5
+    std::vector<float> h_sqErrors(size);
+    std::vector<float> h_grad(size);
+    
+    float *d_pred, *d_target, *d_sqErrors, *d_grad;
+    CHECK(cudaMalloc(&d_pred, size * sizeof(float)));
+    CHECK(cudaMalloc(&d_target, size * sizeof(float)));
+    CHECK(cudaMalloc(&d_sqErrors, size * sizeof(float)));
+    CHECK(cudaMalloc(&d_grad, size * sizeof(float)));
+    
+    CHECK(cudaMemcpy(d_pred, h_pred.data(), size * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(d_target, h_target.data(), size * sizeof(float), cudaMemcpyHostToDevice));
+    
+    int blockSize = 256;
+    int gridSize = (size + blockSize - 1) / blockSize;
+    MSELossForward<<<gridSize, blockSize>>>(d_pred, d_target, d_sqErrors, d_grad, size);
+    CHECK(cudaGetLastError());
+    CHECK(cudaDeviceSynchronize());
+    
+    CHECK(cudaMemcpy(h_sqErrors.data(), d_sqErrors, size * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(h_grad.data(), d_grad, size * sizeof(float), cudaMemcpyDeviceToHost));
+    
+    float mse = 0;
+    for (auto e : h_sqErrors) mse += e;
+    mse /= size;
+    
+    std::cout << "Pred:   "; for (auto v : h_pred) std::cout << v << " "; std::cout << "\n";
+    std::cout << "Target: "; for (auto v : h_target) std::cout << v << " "; std::cout << "\n";
+    std::cout << "MSE = " << mse << " (expected: 0.25)\n";
+    std::cout << "Grad: "; for (auto v : h_grad) std::cout << v << " "; std::cout << "\n\n";
+    
+    cudaFree(d_pred);
+    cudaFree(d_target);
+    cudaFree(d_sqErrors);
+    cudaFree(d_grad);
+}
+
 int main(int argc, char **argv) {
     std::cout << "CUDA Kernel Tests\n";
     std::cout << "=================\n\n";
     
+    printDeviceInfo();
+    
     testReLU();
     testSigmoid();
     testMaxPool2x2();
+    testUpsample2x2();
+    testConv2DForward();
+    testMSELoss();
+    testSumReduction();
     
     std::cout << "All tests completed\n";
     return 0;
@@ -550,7 +879,7 @@ int main(int argc, char **argv) {
 //         Autoencoder model; 
 //         double totalTrainTime = 0;
 //         std::vector<EpochStats> epochStats;
-        
+
 //         std::cout << "\n========== CPU BASELINE TRAINING ==========\n";
 //         std::cout << "Hyperparameters:\n";
 //         std::cout << "Batch size:     " << config.batchSize << "\n";
@@ -559,15 +888,15 @@ int main(int argc, char **argv) {
 //         std::cout << "Train samples:  " << trainLoader.numSamples() << "\n";
 //         std::cout << "Test samples:   " << testLoader.numSamples() << "\n";
 //         std::cout << "=============================================\n\n";
-        
+
 //         for (int epoch = 1; epoch <= config.epochs; epoch++) {
 //             std::cout << "Epoch " << epoch << "/" << config.epochs << "\n";
 //             EpochStats stats = runEpoch(model, trainLoader, config.batchSize, config.learningRate, config.logEvery);
 //             float valLoss = evaluate(model, testLoader, config.batchSize);
-            
+
 //             totalTrainTime += stats.epochTimeMs;
 //             epochStats.push_back(stats);
-            
+
 //             std::cout << std::fixed << std::setprecision(6) << "train_loss=" << stats.loss << " " << "val_loss=" << valLoss << "\n";
 //             std::cout << std::fixed << std::setprecision(2) << "epoch_time=" << stats.epochTimeMs << " ms " << "throughput=" << stats.imagesPerSec << " img/s\n\n";
 //         }
