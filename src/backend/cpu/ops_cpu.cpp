@@ -21,6 +21,16 @@ void cpu_matmul(const Tensor& A, const Tensor& B, Tensor& C) {
     }
 }
 
+void cpu_add(const Tensor& A, const Tensor& B, Tensor& C) {
+    size_t n = A.numel();
+    const float* a_ptr = (const float*)A.data_ptr();
+    const float* b_ptr = (const float*)B.data_ptr();
+    float* c_ptr = (float*)C.data_ptr();
+
+    for (size_t i = 0; i < n; ++i) {
+        c_ptr[i] = a_ptr[i] + b_ptr[i];
+    }
+}
 
 // ================= Conv2D =================
 void cpu_conv2d(const Tensor& in, const Tensor& k, const Tensor& b, Tensor& out, int stride, int padding) {
@@ -311,6 +321,44 @@ void cpu_upsample2d_backward(const Tensor& grad_out, Tensor& grad_in, int scale)
                 }
             }
         }
+    }
+}
+
+// ================= Sigmoid =================
+// Forward: y = 1 / (1 + e^-x)
+void cpu_sigmoid_forward(const Tensor& in, Tensor& out) {
+    size_t n = in.numel();
+    
+    // Dùng __restrict__ để trình biên dịch tối ưu vector hóa (AVX)
+    const float* __restrict__ in_ptr = (const float*)in.data_ptr();
+    float* __restrict__ out_ptr = (float*)out.data_ptr();
+
+    for(size_t i = 0; i < n; ++i) {
+        float x = in_ptr[i];
+        
+        // FIX NAN: Kẹp giá trị x trong khoảng an toàn (-88, 88)
+        // exp(88) là giới hạn của float.
+        if (x > 88.0f) {
+            out_ptr[i] = 1.0f; 
+        } else if (x < -88.0f) {
+            out_ptr[i] = 0.0f;
+        } else {
+            out_ptr[i] = 1.0f / (1.0f + std::exp(-x));
+        }
+    }
+}
+
+// Backward: dL/dx = dL/dy * y * (1 - y)
+void cpu_sigmoid_backward(const Tensor& out_cache, const Tensor& grad_out, Tensor& grad_in) {
+    size_t n = out_cache.numel();
+    
+    const float* __restrict__ y_ptr = (const float*)out_cache.data_ptr();
+    const float* __restrict__ go_ptr = (const float*)grad_out.data_ptr();
+    float* __restrict__ gi_ptr = (float*)grad_in.data_ptr();
+
+    for(size_t i = 0; i < n; ++i) {
+        float y = y_ptr[i];
+        gi_ptr[i] = go_ptr[i] * y * (1.0f - y);
     }
 }
 

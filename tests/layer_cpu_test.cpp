@@ -8,12 +8,11 @@
 #include "../include/core/Tensor.h"
 
 // Include Layers
-#include "../include/layers/Dense.h"
-#include "../include/layers/Conv2D.h"
-#include "../include/layers/ReLU.h"
-#include "../include/layers/MaxPool2D.h"
-#include "../include/layers/Upsample.h"
-
+//#include "layers/Dense.h"
+#include "layers/Conv2D.h"
+#include "layers/ReLU.h"
+#include "layers/MaxPool2D.h"
+#include "layers/Upsample.h"
 // ======================================================================
 // UTILS: HÀM IN TENSOR ĐẸP (HIỂN THỊ DATA)
 // ======================================================================
@@ -92,33 +91,33 @@ void fill_const(Tensor& t, float val) {
 // TEST CASES
 // ======================================================================
 
-void test_dense() {
-    std::cout << "\n>>> TEST: DENSE (FULLY CONNECTED) <<<" << std::endl;
-    // Input: [2, 3]
-    Tensor x = Tensor::zeros({2, 3}, DeviceType::CPU);
-    fill_range(x); // 0 1 2; 3 4 5
+// void test_dense() {
+//     std::cout << "\n>>> TEST: DENSE (FULLY CONNECTED) <<<" << std::endl;
+//     // Input: [2, 3]
+//     Tensor x = Tensor::zeros({2, 3}, DeviceType::CPU);
+//     fill_range(x); // 0 1 2; 3 4 5
     
-    // Dense Layer: 3 input -> 2 output
-    Dense layer(3, 2);
+//     // Dense Layer: 3 input -> 2 output
+//     Dense layer(3, 2);
     
-    // Gán Weight cố định để dễ nhẩm: Toàn số 1
-    // W shape: [3, 2]
-    fill_const(layer.W, 1.0f);
+//     // Gán Weight cố định để dễ nhẩm: Toàn số 1
+//     // W shape: [3, 2]
+//     fill_const(layer.W, 1.0f);
     
-    // Gán Bias cố định: 0.5
-    fill_const(layer.b, 0.5f);
+//     // Gán Bias cố định: 0.5
+//     fill_const(layer.b, 0.5f);
 
-    print_tensor_box("Input X", x);
-    print_tensor_box("Weights W", layer.W);
-    print_tensor_box("Bias b", layer.b);
+//     print_tensor_box("Input X", x);
+//     print_tensor_box("Weights W", layer.W);
+//     print_tensor_box("Bias b", layer.b);
 
-    Tensor y = layer.forward(x);
+//     Tensor y = layer.forward(x);
     
-    // Giải thích tính toán:
-    // Hàng 0 của X: [0, 1, 2] -> Nhân với cột W (toàn 1) -> 0+1+2 = 3. Cộng bias 0.5 -> 3.5
-    // Hàng 1 của X: [3, 4, 5] -> Nhân với cột W (toàn 1) -> 3+4+5 = 12. Cộng bias 0.5 -> 12.5
-    print_tensor_box("Output Y", y);
-}
+//     // Giải thích tính toán:
+//     // Hàng 0 của X: [0, 1, 2] -> Nhân với cột W (toàn 1) -> 0+1+2 = 3. Cộng bias 0.5 -> 3.5
+//     // Hàng 1 của X: [3, 4, 5] -> Nhân với cột W (toàn 1) -> 3+4+5 = 12. Cộng bias 0.5 -> 12.5
+//     print_tensor_box("Output Y", y);
+// }
 
 void test_conv2d() {
     std::cout << "\n>>> TEST: CONV2D <<<" << std::endl;
@@ -211,7 +210,7 @@ void test_upsample() {
 }
 
 int main() {
-    test_dense();
+    //test_dense();
     test_conv2d();
     test_relu();
     test_maxpool();

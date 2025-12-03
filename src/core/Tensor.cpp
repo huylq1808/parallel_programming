@@ -91,13 +91,17 @@ Tensor Tensor::matmul(const Tensor& other) const {
 
 Tensor Tensor::add(const Tensor& other) const {
     Tensor out = Tensor::zeros(sizes, device);
-    if(device == DeviceType::CPU) {
-        float* c = (float*)out.data_ptr();
-        const float* a = (const float*)data_ptr();
-        const float* b = (const float*)other.data_ptr();
-        for(size_t i=0; i<numel(); ++i) c[i] = a[i] + b[i];
+    if (device == DeviceType::CPU) {
+        // Bạn cần khai báo hàm này trong Ops.h và implement trong ops_cpu.cpp
+        cpu_add(*this, other, out); 
     }
-    // TODO: Add CUDA implementation
+    #ifdef USE_CUDA
+    else {
+        // Bạn cần khai báo hàm này trong Ops.h và implement trong ops_bridge.cu
+        cuda_add_dispatch(*this, other, out);
+    }
+    #endif
+
     return out;
 }
 

@@ -1,5 +1,5 @@
-#include "../../../include/core/Ops.h"
-#include "../../../include/core/Config.h"
+#include "core/Ops.h"
+#include "core/Config.h"
 #include <iostream>
 
 #ifdef USE_CUDA
@@ -14,6 +14,11 @@ void cuda_matmul_dispatch(const Tensor& A, const Tensor& B, Tensor& C) {
         // Call your Naive Kernel here
     }
 }
+
+void cuda_add_dispatch(const Tensor& A, const Tensor& B, Tensor& C) {
+    std::cout << "[GPU] Add Operation called (Placeholder)\n";
+}
+
 // --- Conv2D Operations ---
 void cuda_conv2d_dispatch(const Tensor& in, const Tensor& k, const Tensor& b, Tensor& out, int s, int p) {
     std::cout << "[GPU] Conv2D Forward called (Placeholder)\n";
@@ -50,6 +55,15 @@ void cuda_upsample2d_forward_dispatch(const Tensor& in, Tensor& out, int scale) 
 
 void cuda_upsample2d_backward_dispatch(const Tensor& grad_out, Tensor& grad_in, int scale) {
     std::cout << "[GPU] Upsample2D Backward called (Placeholder)\n";
+}
+
+// --- Sigmoid Operations ---
+void cuda_sigmoid_forward_dispatch(const Tensor& in, Tensor& out) {
+    std::cout << "[GPU] Sigmoid Forward called (Placeholder)\n";
+}
+
+void cuda_sigmoid_backward_dispatch(const Tensor& out_cache, const Tensor& grad_out, Tensor& grad_in) {
+    std::cout << "[GPU] Sigmoid Backward called (Placeholder)\n";
 }
 
 // --- MSE Loss Dispatchers ---

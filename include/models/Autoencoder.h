@@ -1,11 +1,11 @@
 #pragma once
 #include <vector>
-#include "../layers/ILayer.h"
-#include "../layers/Conv2D.h"
-#include "../layers/ReLU.h"
-#include "../layers/MaxPool2D.h"
-#include "../layers/Upsample.h"
-
+#include "layers/ILayer.h"
+#include "layers/Conv2D.h"
+#include "layers/ReLU.h"
+#include "layers/MaxPool2D.h"
+#include "layers/Upsample.h"
+#include "layers/Sigmoid.h"
 class Autoencoder {
 public:
     // --- ENCODER LAYERS ---
@@ -26,7 +26,8 @@ public:
     ReLU dec_relu2;
     Upsample dec_up2;
 
-    Conv2D dec_conv3; // Output layer (No activation)
+    Conv2D dec_conv3; 
+    Sigmoid dec_sigmoid;
 
     Autoencoder() 
         // Init Encoder
@@ -40,7 +41,8 @@ public:
           dec_up1(2),
           dec_conv2(128, 256, 3, 1, 1),
           dec_up2(2),
-          dec_conv3(256, 3, 3, 1, 1) 
+          dec_conv3(256, 3, 3, 1, 1),
+          dec_sigmoid()
     {}
 
     // Thu thập tất cả tham số của mạng để đưa cho Optimizer
@@ -77,13 +79,15 @@ public:
         out = dec_up2.forward(out);   // -> (32, 32, 256)
 
         out = dec_conv3.forward(out); // -> (32, 32, 3)
+        out = dec_sigmoid.forward(out);
         return out;
     }
 
     void backward(const Tensor& grad_output) {
         // Decoder Backward
-        Tensor d = dec_conv3.backward(grad_output);
-        
+        Tensor d = dec_sigmoid.backward(grad_output);
+        d = dec_conv3.backward(d);
+
         d = dec_up2.backward(d);
         d = dec_relu2.backward(d);
         d = dec_conv2.backward(d);

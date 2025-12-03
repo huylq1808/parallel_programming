@@ -3,6 +3,15 @@ project(DeepLearningCPP)
 
 set(CMAKE_CXX_STANDARD 17)
 
+# --- THÊM ĐOẠN NÀY ĐỂ TĂNG TỐC ---
+if(NOT MSVC) # Nếu dùng GCC hoặc Clang (g++)
+    # -O3: Tối ưu hóa cấp cao nhất
+    # -march=native: Dùng tập lệnh CPU đặc thù (AVX/SSE) để tính toán song song
+    # -ffast-math: Chấp nhận sai số cực nhỏ để tính exp/sqrt nhanh hơn (rất tốt cho DL)
+    # -funroll-loops: Mở rộng vòng lặp để giảm chi phí nhảy (jump)
+    add_compile_options(-O3 -march=native -ffast-math -funroll-loops)
+endif()
+
 # --- 1. CUDA DETECTION ---
 include(CheckLanguage)
 check_language(CUDA)
@@ -33,9 +42,10 @@ set(BACKEND_CPU_SRC src/backend/cpu/ops_cpu.cpp)
 
 # Layers (Cho App chính)
 set(LAYER_SRC 
-    src/layers/Dense.cpp 
+    # src/layers/Dense.cpp 
     src/layers/Conv2D.cpp
-    src/layers/ReLU.cpp        
+    src/layers/ReLU.cpp   
+    src/layers/Sigmoid.cpp
     src/layers/MaxPool2D.cpp   
     src/layers/Upsample.cpp
 )
