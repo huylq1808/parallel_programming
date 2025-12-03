@@ -10,4 +10,5 @@ public:
     virtual Tensor backward(const Tensor& grad_output) = 0;
     virtual std::vector<Tensor*> parameters() { return {}; }
     virtual std::string name() const = 0;
+    virtual void to(DeviceType device) {}
 };

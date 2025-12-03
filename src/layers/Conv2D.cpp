@@ -4,7 +4,7 @@
 Conv2D::Conv2D(int in, int out, int k, int s, int p) 
     : in_c(in), out_c(out), k_size(k), stride(s), padding(p) 
 {
-    W = Tensor::randn({out, in, k, k}, 0.0f, 0.1f);
+    W = Tensor::randn({out, in, k, k}, 0.0f, 0.01f);
     b = Tensor::zeros({out});
     W.requires_grad = true; b.requires_grad = true;
 }
@@ -41,4 +41,9 @@ Tensor Conv2D::backward(const Tensor& grad_output) {
     }
     #endif
     return dIn;
+}
+
+void Conv2D::to(DeviceType device) {
+    W = W.to(device);
+    b = b.to(device);
 }

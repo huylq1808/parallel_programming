@@ -1,5 +1,5 @@
-#include "../../include/core/Storage.h"
-#include "../../include/core/Allocator.h"
+#include "core/Storage.h"
+#include "core/Allocator.h"
 #include <stdexcept>
 
 Storage Storage::create_cpu(size_t bytes) {

@@ -1,6 +1,6 @@
-#include "../../include/core/Tensor.h"
-#include "../../include/core/Ops.h"
-#include "../../include/core/CheckError.h"
+#include "core/Tensor.h"
+#include "core/Ops.h"
+#include "core/CheckError.h"
 #include <cstring>
 #include <numeric>
 #include <random>

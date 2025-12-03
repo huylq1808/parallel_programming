@@ -1,5 +1,5 @@
-#include "../../include/core/Allocator.h"
-#include "../../include/core/CheckError.h"
+#include "core/Allocator.h"
+#include "core/CheckError.h"
 #include <cstdlib>
 #include <stdexcept>
 

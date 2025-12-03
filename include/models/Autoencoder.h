@@ -107,11 +107,11 @@ public:
     }
     
     // chuyển tham số sang GPU . có thể thay thế sau này bằng GPU <-> CPU
-    void to_gpu() {
-        #ifdef USE_CUDA
-        for (auto p : parameters()) {
-            *p = p->to(DeviceType::CUDA);
-        }
-        #endif
+    void to(DeviceType device) {
+        enc_conv1.to(device);
+        enc_conv2.to(device);
+        dec_conv1.to(device);
+        dec_conv2.to(device);
+        dec_conv3.to(device);
     }
 };

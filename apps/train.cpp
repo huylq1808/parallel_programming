@@ -75,7 +75,7 @@ int main(int argc, char** argv) {
     
     // Chuyển model sang GPU
     if (device == DeviceType::CUDA) {
-        model.to_gpu(); // Hàm này đã có trong Autoencoder.h bạn cung cấp trước đó
+        model.to(DeviceType::CUDA); // Hàm này đã có trong Autoencoder.h bạn cung cấp trước đó
     }
 
     MSELoss criterion;

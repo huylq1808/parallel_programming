@@ -12,4 +12,5 @@ public:
     Tensor backward(const Tensor& grad_output) override;
     std::vector<Tensor*> parameters() override { return {&W, &b}; }
     std::string name() const override { return "Conv2D"; }
+    void to(DeviceType device) override;
 };

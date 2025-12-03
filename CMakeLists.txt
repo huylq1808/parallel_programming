@@ -2,13 +2,10 @@ cmake_minimum_required(VERSION 3.18)
 project(DeepLearningCPP)
 
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CUDA_ARCHITECTURES native)
 
 # --- THÊM ĐOẠN NÀY ĐỂ TĂNG TỐC ---
-if(NOT MSVC) # Nếu dùng GCC hoặc Clang (g++)
-    # -O3: Tối ưu hóa cấp cao nhất
-    # -march=native: Dùng tập lệnh CPU đặc thù (AVX/SSE) để tính toán song song
-    # -ffast-math: Chấp nhận sai số cực nhỏ để tính exp/sqrt nhanh hơn (rất tốt cho DL)
-    # -funroll-loops: Mở rộng vòng lặp để giảm chi phí nhảy (jump)
+if(NOT MSVC)
     add_compile_options(-O3 -march=native -ffast-math -funroll-loops)
 endif()
 
@@ -58,7 +55,15 @@ set(OPTIM_SRC src/optim/SGD.cpp)
 
 # GPU Ops (Nếu có)
 if(CMAKE_CUDA_COMPILER)
-    set(BACKEND_GPU_SRC src/backend/cuda/ops_bridge.cu)
+    set(BACKEND_GPU_SRC 
+        src/backend/cuda/ops_bridge.cu
+        src/backend/cuda/kernels/naive/ElementWise.cu
+        src/backend/cuda/kernels/naive/Conv2D.cu
+        src/backend/cuda/kernels/naive/Activation.cu
+        src/backend/cuda/kernels/naive/Pooling.cu
+        src/backend/cuda/kernels/naive/Upsample.cu
+        src/backend/cuda/kernels/naive/Loss_Optimizer.cu
+    )
 endif()
 
 # =========================================================
@@ -77,15 +82,26 @@ if(CMAKE_CUDA_COMPILER)
     target_link_libraries(benchmark PRIVATE CUDA::cudart)
 endif()
 
-# 1. Train App
-add_executable(train_net 
-    apps/train.cpp
+# --- APP 1: CPU TRAINER ---
+add_executable(train_cpu
+    apps/train_cpu.cpp  # <--- File mới
     ${CORE_SRC} ${BACKEND_CPU_SRC} ${LAYER_SRC} 
     ${LOSS_SRC} ${OPTIM_SRC}
-    ${BACKEND_GPU_SRC}
+    ${BACKEND_GPU_SRC} # Vẫn link vào để tránh lỗi linker nếu Ops.h có tham chiếu chéo, nhưng runtime không dùng
 )
 if(CMAKE_CUDA_COMPILER)
-    target_link_libraries(train_net PRIVATE CUDA::cudart)
+    target_link_libraries(train_cpu PRIVATE CUDA::cudart)
+endif()
+
+# --- APP 2: GPU TRAINER ---
+if(CMAKE_CUDA_COMPILER)
+    add_executable(train_gpu
+        apps/train_gpu.cpp  # <--- File mới
+        ${CORE_SRC} ${BACKEND_CPU_SRC} ${LAYER_SRC} 
+        ${LOSS_SRC} ${OPTIM_SRC}
+        ${BACKEND_GPU_SRC}
+    )
+    target_link_libraries(train_gpu PRIVATE CUDA::cudart)
 endif()
 
 # 2. Inference App
@@ -96,6 +112,16 @@ add_executable(infer_net
 )
 if(CMAKE_CUDA_COMPILER)
     target_link_libraries(infer_net PRIVATE CUDA::cudart)
+endif()
+
+# 3. Visualization Export App
+add_executable(visualize_export
+    apps/visualize_export.cpp
+    ${CORE_SRC} ${BACKEND_CPU_SRC} ${LAYER_SRC} 
+    ${BACKEND_GPU_SRC}
+)
+if(CMAKE_CUDA_COMPILER)
+    target_link_libraries(visualize_export PRIVATE CUDA::cudart)
 endif()
 
 # =========================================================
