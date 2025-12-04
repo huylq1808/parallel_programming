@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <chrono>
 
+constexpr int BLOCK_SIZE = 32;
+
 #define CHECK(call)\
 {\
 	const cudaError_t error = call;\
@@ -174,7 +176,7 @@ private:
     void loadSplit(const std::filesystem::path &root, Split split) {
         std::vector<std::filesystem::path> files;
         if (split == Split::Train) {
-            for (int i = 1; i <= 1; i++) {
+            for (int i = 1; i <= 5; i++) {
                 files.emplace_back(root / ("data_batch_" + std::to_string(i) + ".bin"));
             }
         }
@@ -507,12 +509,446 @@ __global__ void sumReductionKernel(const float *__restrict__ input, float *__res
         atomicAdd(output, sdata[0]);
 }
 
-// struct TrainConfig {
-//     int epochs = 10;
-//     int batchSize = 64;
-//     float learningRate = 0.001f;
-//     int logEvery = 100; 
-// };
+void xavierUniformInit(float* data, size_t count, int fanIn, int fanOut, unsigned seed) {
+    std::mt19937 rng(seed);
+    float limit = std::sqrt(6.0f / (fanIn + fanOut));
+    std::uniform_real_distribution<float> dist(-limit, limit);
+    for (size_t i = 0; i < count; i++)
+        data[i] = dist(rng);
+}
+
+struct GpuTensor {
+    float *data = nullptr;
+    int n = 0, c = 0, h = 0, w = 0;
+
+    GpuTensor() = default;
+
+    void allocate(int n_, int c_, int h_, int w_) {
+        free(); // release old memory 
+        n = n_;
+        c = c_;
+        h = h_;
+        w = w_;
+        size_t bytes = elements() * sizeof(float);
+        CHECK(cudaMalloc(&data, bytes));
+        CHECK(cudaMemset(data, 0, bytes));
+    }
+
+    void free() {
+        if (data) {
+            cudaFree(data);
+            data = nullptr;
+        }
+        n = c = h = w = 0;
+    }
+
+    size_t elements() const { return static_cast<size_t>(n) * c * h * w; }
+    size_t bytes() const { return elements() * sizeof(float); }
+
+    void copyFromHost(const Tensor &host) {
+        if (elements() != host.elements())
+            allocate(host.n, host.c, host.h, host.w);
+
+        CHECK(cudaMemcpy(data, host.data.data(), bytes(), cudaMemcpyHostToDevice));
+    }
+
+    void copyToHost(Tensor &host) const {
+        host.resize(n, c, h, w);
+        CHECK(cudaMemcpy(host.data.data(), data, bytes(), cudaMemcpyDeviceToHost));
+    }
+
+    void zero() {
+        if (data && elements() > 0)
+            CHECK(cudaMemset(data, 0, bytes()));
+    }
+
+    ~GpuTensor() { free(); }
+
+    // knông cho copy, tránh bị double free
+    GpuTensor(const GpuTensor &) = delete;
+    GpuTensor &operator=(const GpuTensor &) = delete;
+
+    
+    GpuTensor(GpuTensor &&other) noexcept: data(other.data), n(other.n), c(other.c), h(other.h), w(other.w) {
+        other.data = nullptr;
+        other.n = other.c = other.h = other.w = 0;
+    }
+
+    GpuTensor &operator=(GpuTensor &&other) noexcept {
+        if (this != &other) {
+            free();
+            data = other.data;
+            n = other.n;
+            c = other.c;
+            h = other.h;
+            w = other.w;
+            other.data = nullptr;
+            other.n = other.c = other.h = other.w = 0;
+        }
+        return *this;
+    }
+};
+
+class GpuConv2D {
+private: 
+    int inChannels_, outChannels_, kernelSize_, padding_;
+    float *d_weights_ = nullptr;
+    float *d_bias_ = nullptr;
+    float *d_gradWeights_ = nullptr;
+    float *d_gradBias_ = nullptr;
+
+    // Cached for backward
+    float *d_lastInput_ = nullptr;
+    int lastN_ = 0, lastH_ = 0, lastW_ = 0;
+
+public:
+    GpuConv2D(int inChannels, int outChannels, int kernelSize, int padding = 1) : inChannels_(inChannels), outChannels_(outChannels), kernelSize_(kernelSize), padding_(padding) {
+        size_t weightCount = static_cast<size_t>(outChannels_) * inChannels_ * kernelSize_ * kernelSize_;
+
+        CHECK(cudaMalloc(&d_weights_, weightCount * sizeof(float)));
+        CHECK(cudaMalloc(&d_bias_, outChannels_ * sizeof(float)));
+        CHECK(cudaMalloc(&d_gradWeights_, weightCount * sizeof(float)));
+        CHECK(cudaMalloc(&d_gradBias_, outChannels_ * sizeof(float)));
+
+        std::vector<float> h_weights(weightCount);
+        std::vector<float> h_bias(outChannels_, 0.0f);
+
+        unsigned seed = inChannels * 13 + outChannels * 17;
+        int fanIn = inChannels * kernelSize * kernelSize;
+        int fanOut = outChannels * kernelSize * kernelSize;
+        xavierUniformInit(h_weights.data(), weightCount, fanIn, fanOut, seed);
+
+        CHECK(cudaMemcpy(d_weights_, h_weights.data(), weightCount * sizeof(float), cudaMemcpyHostToDevice));
+        CHECK(cudaMemcpy(d_bias_, h_bias.data(), outChannels_ * sizeof(float), cudaMemcpyHostToDevice));
+    }
+
+    ~GpuConv2D() {
+        if (d_weights_)
+            cudaFree(d_weights_);
+        if (d_bias_)
+            cudaFree(d_bias_);
+        if (d_gradWeights_)
+            cudaFree(d_gradWeights_);
+        if (d_gradBias_)
+            cudaFree(d_gradBias_);
+    }
+
+    void forward(const GpuTensor &input, GpuTensor &output) {
+        lastN_ = input.n;
+        lastH_ = input.h;
+        lastW_ = input.w;
+        d_lastInput_ = input.data;
+
+        if (output.n != input.n || output.c != outChannels_ ||output.h != input.h || output.w != input.w)
+            output.allocate(input.n, outChannels_, input.h, input.w);
+
+        dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+        dim3 grid((input.w + block.x - 1) / block.x, (input.h + block.y - 1) / block.y, input.n * outChannels_);
+
+        conv2dForwardKernel<<<grid, block>>>(input.data, d_weights_, d_bias_, output.data,input.n, inChannels_, outChannels_, input.h, input.w, kernelSize_, padding_);
+    }
+
+    void backward(const GpuTensor &gradOutput, GpuTensor &gradInput, float learningRate) {
+        size_t weightCount = static_cast<size_t>(outChannels_) * inChannels_ * kernelSize_ * kernelSize_;
+        CHECK(cudaMemset(d_gradWeights_, 0, weightCount * sizeof(float)));
+        CHECK(cudaMemset(d_gradBias_, 0, outChannels_ * sizeof(float)));
+        
+        if (gradInput.n != lastN_ || gradInput.c != inChannels_ || gradInput.h != lastH_ || gradInput.w != lastW_)
+            gradInput.allocate(lastN_, inChannels_, lastH_, lastW_);
+        
+        gradInput.zero();
+
+        dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+        dim3 gridInput(
+            (lastW_ + block.x - 1) / block.x,
+            (lastH_ + block.y - 1) / block.y,
+            lastN_ * inChannels_);
+
+        conv2dBackwardInputKernel<<<gridInput, block>>>(gradOutput.data, d_weights_, gradInput.data,lastN_, inChannels_, outChannels_, lastH_, lastW_, kernelSize_, padding_);
+
+        dim3 gridWeights(outChannels_, inChannels_, kernelSize_ * kernelSize_);
+        conv2dBackwardWeightsKernel<<<gridWeights, 1>>>(d_lastInput_, gradOutput.data, d_gradWeights_, lastN_, inChannels_, outChannels_, lastH_, lastW_, kernelSize_, padding_);
+
+        int biasBlocks = (outChannels_ + 255) / 256;
+        conv2dBackwardBiasKernel<<<biasBlocks, 256>>>(gradOutput.data, d_gradBias_, lastN_, outChannels_, lastH_, lastW_);
+
+        float scale = 1.0f / static_cast<float>(lastN_);
+        int updateBlocks = (weightCount + 255) / 256;
+        sgdUpdateKernel<<<updateBlocks, 256>>>(d_weights_, d_gradWeights_, learningRate, scale, weightCount);
+
+        int biasUpdateBlocks = (outChannels_ + 255) / 256;
+        sgdUpdateKernel<<<biasUpdateBlocks, 256>>>(d_bias_, d_gradBias_, learningRate, scale, outChannels_);
+    }
+
+};
+
+class GpuReLU {
+private:
+    uint8_t *d_mask_ = nullptr;
+    int maskSize_ = 0;
+
+public: 
+    void forward(const GpuTensor &input, GpuTensor &output) {
+        int size = input.elements();
+
+        if (maskSize_ < size) {
+            if (d_mask_)
+                cudaFree(d_mask_);
+            CHECK(cudaMalloc(&d_mask_, size * sizeof(uint8_t)));
+            maskSize_ = size;
+        }
+
+        if (output.elements() != input.elements())
+            output.allocate(input.n, input.c, input.h, input.w);
+
+        int blocks = (size + 255) / 256;
+        ReLUForward<<<blocks, 256>>>(input.data, output.data, d_mask_, size);
+    }
+
+    void backward(const GpuTensor &gradOutput, GpuTensor &gradInput) {
+        int size = gradOutput.elements();
+
+        if (gradInput.elements() != size)
+            gradInput.allocate(gradOutput.n, gradOutput.c, gradOutput.h, gradOutput.w);
+
+        int blocks = (size + 255) / 256;
+        ReLUBackward<<<blocks, 256>>>(gradOutput.data, gradInput.data, d_mask_, size);
+    }
+
+    ~GpuReLU() {
+        if (d_mask_)
+            cudaFree(d_mask_);
+    }
+};
+
+class GpuSigmoid {
+private:
+    const GpuTensor *cachedOutput_ = nullptr;
+
+public: 
+    GpuSigmoid() = default;
+
+    ~GpuSigmoid() {
+        if (cachedOutput_)
+            cachedOutput_ = nullptr;
+    }
+
+    void forward(const GpuTensor &input, GpuTensor &output) {
+        if (output.elements() != input.elements())
+            output.allocate(input.n, input.c, input.h, input.w);
+
+        cachedOutput_ = &output;
+
+        int size = input.elements();
+        int blocks = (size + 255) / 256;
+        SigmoidForward<<<blocks, 256>>>(input.data, output.data, size);
+    }
+
+    void backward(const GpuTensor &gradOutput, GpuTensor &gradInput) {
+        int size = gradOutput.elements();
+
+        if (gradInput.elements() != size)
+            gradInput.allocate(gradOutput.n, gradOutput.c, gradOutput.h, gradOutput.w);
+
+        int blocks = (size + 255) / 256;
+        SigmoidBackward<<<blocks, 256>>>(gradOutput.data, cachedOutput_->data, gradInput.data, size);
+    }
+};
+
+class GpuMaxPool2x2 {
+private:
+    int *d_maxIndices_ = nullptr;
+    int maxIndicesSize_ = 0;
+    int inN_ = 0, inC_ = 0, inH_ = 0, inW_ = 0;
+
+public:
+   void forward(const GpuTensor &input, GpuTensor &output) {
+        int outH = input.h / 2;
+        int outW = input.w / 2;
+
+        inN_ = input.n;
+        inC_ = input.c;
+        inH_ = input.h;
+        inW_ = input.w;
+
+        if (output.n != input.n || output.c != input.c || output.h != outH || output.w != outW)
+            output.allocate(input.n, input.c, outH, outW);
+
+        int outSize = output.elements();
+        if (maxIndicesSize_ < outSize) {
+            if (d_maxIndices_)
+                cudaFree(d_maxIndices_);
+            CHECK(cudaMalloc(&d_maxIndices_, outSize * sizeof(int)));
+            maxIndicesSize_ = outSize;
+        }
+
+        dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+        dim3 grid((outW + block.x - 1) / block.x, (outH + block.y - 1) / block.y, input.n * input.c);
+
+        MaxPool2x2Forward<<<grid, block>>>(input.data, output.data, d_maxIndices_, input.n, input.c, input.h, input.w);
+    }
+
+    void backward(const GpuTensor &gradOutput, GpuTensor &gradInput) {
+        if (gradInput.n != inN_ || gradInput.c != inC_ || gradInput.h != inH_ || gradInput.w != inW_)
+            gradInput.allocate(inN_, inC_, inH_, inW_);
+        
+        gradInput.zero();
+
+        int outSize = gradOutput.elements();
+        int inSize = gradInput.elements();
+        int blocks = (outSize + 255) / 256;
+
+        MaxPool2x2Backward<<<blocks, 256>>>(gradOutput.data, d_maxIndices_, gradInput.data, outSize, inSize);
+    }
+
+    ~GpuMaxPool2x2() {
+        if (d_maxIndices_)
+            cudaFree(d_maxIndices_);
+    }
+
+};
+
+class GpuUpsample2x2 {
+private:
+    int inN_ = 0, inC_ = 0, inH_ = 0, inW_ = 0;
+
+public:
+    void forward(const GpuTensor &input, GpuTensor &output) {
+        int outH = input.h * 2;
+        int outW = input.w * 2;
+
+        inN_ = input.n;
+        inC_ = input.c;
+        inH_ = input.h;
+        inW_ = input.w;
+
+        if (output.n != input.n || output.c != input.c || output.h != outH || output.w != outW)
+            output.allocate(input.n, input.c, outH, outW);
+    
+
+        dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+        dim3 grid((outW + block.x - 1) / block.x, (outH + block.y - 1) / block.y, input.n * input.c);
+
+        Upsample2x2Forward<<<grid, block>>>(input.data, output.data, input.n, input.c, input.h, input.w);
+    }
+
+    void backward(const GpuTensor &gradOutput, GpuTensor &gradInput) {
+        if (gradInput.n != inN_ || gradInput.c != inC_ || gradInput.h != inH_ || gradInput.w != inW_)
+            gradInput.allocate(inN_, inC_, inH_, inW_);
+
+        dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+        dim3 grid((inW_ + block.x - 1) / block.x, (inH_ + block.y - 1) / block.y,inN_ * inC_);
+
+        Upsample2x2Backward<<<grid, block>>>(gradOutput.data, gradInput.data, inN_, inC_, inH_, inW_);
+    }
+
+};
+
+class GpuMSELoss {
+private:
+    float *d_squaredErrors_ = nullptr;
+    float *d_sum_ = nullptr;
+    int squaredErrorsSize_ = 0;
+
+public:
+    float forward(const GpuTensor &prediction, const GpuTensor &target, GpuTensor &gradOutput) {
+        int size = prediction.elements();
+
+        if (squaredErrorsSize_ < size) {
+            if (d_squaredErrors_)
+                cudaFree(d_squaredErrors_);
+            if (d_sum_)
+                cudaFree(d_sum_);
+            CHECK(cudaMalloc(&d_squaredErrors_, size * sizeof(float)));
+            CHECK(cudaMalloc(&d_sum_, sizeof(float)));
+            squaredErrorsSize_ = size;
+        }
+
+        if (gradOutput.elements() != size)
+            gradOutput.allocate(prediction.n, prediction.c, prediction.h, prediction.w);
+
+        int blocks = (size + 255) / 256;
+        MSELossForward<<<blocks, 256>>>(prediction.data, target.data, d_squaredErrors_, gradOutput.data, size);
+
+        CHECK(cudaMemset(d_sum_, 0, sizeof(float)));
+        sumReductionKernel<<<blocks, 256, 256 * sizeof(float)>>>(
+            d_squaredErrors_, d_sum_, size);
+
+        float sum = 0.0f;
+        CHECK(cudaMemcpy(&sum, d_sum_, sizeof(float), cudaMemcpyDeviceToHost));
+
+        return sum / static_cast<float>(size);
+    }
+
+    ~GpuMSELoss() {
+        if (d_squaredErrors_)
+            cudaFree(d_squaredErrors_);
+        if (d_sum_)
+            cudaFree(d_sum_);
+    }
+
+};
+
+class GpuAutoencoder {
+private:
+    GpuConv2D conv1_, conv2_, conv3_, conv4_;
+    GpuReLU relu1_, relu2_, relu3_;
+    GpuMaxPool2x2 pool_;
+    GpuUpsample2x2 upsample_;
+    GpuSigmoid sigmoid_;
+
+    GpuTensor act1_, act2_, act3_, act4_, act5_, act6_, act7_;
+    GpuTensor pooled_, upsampled_;
+
+    GpuTensor grad1_, grad2_, grad3_, grad4_, grad5_;
+    GpuTensor grad6_, grad7_, grad8_, grad9_, grad10_;
+
+public:
+    GpuAutoencoder()
+        : conv1_(3, 32, 3, 1),
+          conv2_(32, 32, 3, 1),
+          conv3_(32, 32, 3, 1),
+          conv4_(32, 3, 3, 1) {}
+
+    void forward(const GpuTensor &input, GpuTensor &output) {
+        // Encoder
+        conv1_.forward(input, act1_);
+        relu1_.forward(act1_, act2_);
+        conv2_.forward(act2_, act3_);
+        relu2_.forward(act3_, act4_);
+        pool_.forward(act4_, pooled_);
+
+        // Decoder
+        upsample_.forward(pooled_, upsampled_);
+        conv3_.forward(upsampled_, act5_);
+        relu3_.forward(act5_, act6_);
+        conv4_.forward(act6_, act7_);
+        sigmoid_.forward(act7_, output);
+    }
+
+    void backward(const GpuTensor &gradOutput, float learningRate) {
+        sigmoid_.backward(gradOutput, grad1_);
+        conv4_.backward(grad1_, grad2_, learningRate);
+        relu3_.backward(grad2_, grad3_);
+        conv3_.backward(grad3_, grad4_, learningRate);
+        upsample_.backward(grad4_, grad5_);
+
+        pool_.backward(grad5_, grad6_);
+        relu2_.backward(grad6_, grad7_);
+        conv2_.backward(grad7_, grad8_, learningRate);
+        relu1_.backward(grad8_, grad9_);
+        conv1_.backward(grad9_, grad10_, learningRate);
+    }
+
+    const GpuTensor &getLatent() const { return pooled_; }
+};
+
+struct TrainConfig {
+    int epochs = 20;
+    int batchSize = 32;
+    float learningRate = 0.001f;
+    int logEvery = 100; 
+};
 
 void printDeviceInfo() {
     cudaDeviceProp prop;
@@ -835,85 +1271,123 @@ void testMSELoss() {
     cudaFree(d_grad);
 }
 
-int main(int argc, char **argv) {
-    std::cout << "CUDA Kernel Tests\n";
-    std::cout << "=================\n\n";
-    
-    printDeviceInfo();
-    
-    testReLU();
-    testSigmoid();
-    testMaxPool2x2();
-    testUpsample2x2();
-    testConv2DForward();
-    testMSELoss();
-    testSumReduction();
-    
-    std::cout << "All tests completed\n";
-    return 0;
-}
-
 // int main(int argc, char **argv) {
-//     if (argc < 2) {
-//         std::cerr << "Usage: " << argv[0] << " <cifar_root> [epochs] [batch_size] [learning_rate]\n";
-//         return 1;
-//     }
-
-//     const std::filesystem::path cifarRoot = argv[1];
-//     if (!std::filesystem::exists(cifarRoot)) {
-//         std::cerr << "Dataset folder not found: " << cifarRoot << "\n";
-//         return 1;
-//     }
-
-//     TrainConfig config; 
-//     if (argc > 2) config.epochs = std::stoi(argv[2]);
-//     if (argc > 3) config.batchSize = std::stoi(argv[3]);
-//     if (argc > 4) config.learningRate = std::stof(argv[4]);
-
-//     try {
-//         std::cout << "Loading CIFAR-10 from " << cifarRoot << "\n";
-//         CifarDataLoader trainLoader(cifarRoot, CifarDataLoader::Split::Train);
-//         CifarDataLoader testLoader(cifarRoot, CifarDataLoader::Split::Test);
-//         std::cout << "Train samples: " << trainLoader.numSamples() << ", Test samples: " << testLoader.numSamples() << "\n";
-
-//         Autoencoder model; 
-//         double totalTrainTime = 0;
-//         std::vector<EpochStats> epochStats;
-
-//         std::cout << "\n========== CPU BASELINE TRAINING ==========\n";
-//         std::cout << "Hyperparameters:\n";
-//         std::cout << "Batch size:     " << config.batchSize << "\n";
-//         std::cout << "Epochs:         " << config.epochs << "\n";
-//         std::cout << "Learning rate:  " << config.learningRate << "\n";
-//         std::cout << "Train samples:  " << trainLoader.numSamples() << "\n";
-//         std::cout << "Test samples:   " << testLoader.numSamples() << "\n";
-//         std::cout << "=============================================\n\n";
-
-//         for (int epoch = 1; epoch <= config.epochs; epoch++) {
-//             std::cout << "Epoch " << epoch << "/" << config.epochs << "\n";
-//             EpochStats stats = runEpoch(model, trainLoader, config.batchSize, config.learningRate, config.logEvery);
-//             float valLoss = evaluate(model, testLoader, config.batchSize);
-
-//             totalTrainTime += stats.epochTimeMs;
-//             epochStats.push_back(stats);
-
-//             std::cout << std::fixed << std::setprecision(6) << "train_loss=" << stats.loss << " " << "val_loss=" << valLoss << "\n";
-//             std::cout << std::fixed << std::setprecision(2) << "epoch_time=" << stats.epochTimeMs << " ms " << "throughput=" << stats.imagesPerSec << " img/s\n\n";
-//         }
-
-//         std::cout << "========== CPU BASELINE SUMMARY ==========\n";
-//         std::cout << std::fixed << std::setprecision(2);
-//         std::cout << "Total training time:    " << totalTrainTime / 1000.0 << " seconds\n";
-//         std::cout << "Average epoch time:     " << totalTrainTime / config.epochs << " ms\n";
-//         std::cout << "Average throughput:     " << (trainLoader.numSamples() * config.epochs) / (totalTrainTime / 1000.0) << " img/s\n";
-//         std::cout << "Final train loss:       " << std::setprecision(6) << epochStats.back().loss << "\n";
-//         std::cout << "==========================================\n";
-//     }
-
-//     catch (const std::exception &e) {
-//         std::cerr << "Error: " << e.what() << "\n";
-//         return 1;
-//     }
-
+//     std::cout << "CUDA Kernel Tests\n";
+//     std::cout << "=================\n\n";
+    
+//     printDeviceInfo();
+    
+//     testReLU();
+//     testSigmoid();
+//     testMaxPool2x2();
+//     testUpsample2x2();
+//     testConv2DForward();
+//     testMSELoss();
+//     testSumReduction();
+    
+//     std::cout << "All tests completed\n";
 //     return 0;
 // }
+
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <cifar_root> [epochs] [batch_size] [learning_rate]\n";
+        return 1;
+    }
+
+    printDeviceInfo();
+
+    const std::filesystem::path cifarRoot = argv[1];
+    if (!std::filesystem::exists(cifarRoot)) {
+        std::cerr << "Dataset folder not found: " << cifarRoot << "\n";
+        return 1;
+    }
+
+    TrainConfig config; 
+    if (argc > 2) config.epochs = std::stoi(argv[2]);
+    if (argc > 3) config.batchSize = std::stoi(argv[3]);
+    if (argc > 4) config.learningRate = std::stof(argv[4]);
+
+    try {
+        std::cout << "Loading CIFAR-10 from " << cifarRoot << "\n";
+        CifarDataLoader trainLoader(cifarRoot, CifarDataLoader::Split::Train);
+        CifarDataLoader testLoader(cifarRoot, CifarDataLoader::Split::Test);
+        std::cout << "Train samples: " << trainLoader.numSamples() << ", Test samples: " << testLoader.numSamples() << "\n";
+
+        GpuAutoencoder model;
+        GpuMSELoss loss;
+        GpuTensor d_input, d_output, d_gradOutput;
+        double totalTrainTimeMs = 0.0;
+
+        std::cout << "\n========== GPU TRAINING ==========\n";
+        std::cout << "Hyperparameters:\n";
+        std::cout << "Batch size:     " << config.batchSize << "\n";
+        std::cout << "Epochs:         " << config.epochs << "\n";
+        std::cout << "Learning rate:  " << config.learningRate << "\n";
+        std::cout << "Train samples:  " << trainLoader.numSamples() << "\n";
+        std::cout << "Test samples:   " << testLoader.numSamples() << "\n";
+        std::cout << "=============================================\n\n";
+
+        for (int epoch = 1; epoch <= config.epochs; epoch++) {
+            std::cout << "Epoch " << epoch << "/" << config.epochs << "\n";
+            trainLoader.startEpoch(true);
+            size_t steps = (trainLoader.numSamples() + config.batchSize - 1) / config.batchSize;
+            double epochLoss = 0.0;
+            size_t seenSamples = 0;
+
+            GpuTimer epochTimer;
+            epochTimer.Start();
+
+            for (size_t step = 0; step < steps; step++) {
+                Batch batch = trainLoader.nextBatch(config.batchSize);
+
+                // Copy to GPU
+                d_input.copyFromHost(batch.images);
+
+                // Forward
+                model.forward(d_input, d_output);
+
+                // Copy target to GPU (same as input for autoencoder)
+                GpuTensor d_target;
+                d_target.copyFromHost(batch.images);
+
+                // Compute loss
+                float batchLoss = loss.forward(d_output, d_target, d_gradOutput);
+
+                // Backward
+                model.backward(d_gradOutput, config.learningRate);
+
+                epochLoss += batchLoss * batch.images.n;
+                seenSamples += batch.images.n;
+
+                if ((step + 1) % config.logEvery == 0 || step == 0 || step + 1 == steps) {
+                    std::cout << "    batch " << (step + 1) << "/" << steps
+                              << " mse=" << std::fixed << std::setprecision(6) << batchLoss << "\n";
+                }
+            }
+
+            epochTimer.Stop();
+            float epochMs = epochTimer.Elapsed();
+            totalTrainTimeMs += epochMs;
+
+            float avgLoss = epochLoss / seenSamples;
+            float throughput = seenSamples / (epochMs / 1000.0f);
+            std::cout << std::fixed << std::setprecision(6) << "train_loss=" << avgLoss << "\n";
+            std::cout << std::fixed << std::setprecision(2) << "epoch_time=" << epochMs << " ms " << "throughput=" << throughput << " img/s\n\n";
+        }
+
+        std::cout << "========== GPU SUMMARY ==========\n";
+        std::cout << std::fixed << std::setprecision(2);
+        std::cout << "Total training time:    " << totalTrainTimeMs / 1000.0 << " seconds\n";
+        std::cout << "Average epoch time:     " << totalTrainTimeMs / config.epochs << " ms\n";
+        std::cout << "Average throughput:     " << (trainLoader.numSamples() * config.epochs) / (totalTrainTimeMs / 1000.0) << " img/s\n";
+        std::cout << "==========================================\n";
+    }
+
+    catch (const std::exception &e) {
+        std::cerr << "Error: " << e.what() << "\n";
+        return 1;
+    }
+
+    return 0;
+}
