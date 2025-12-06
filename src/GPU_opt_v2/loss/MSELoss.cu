@@ -68,7 +68,7 @@ float MSELoss::forward(const Tensor& input, const Tensor& target) {
         vol_one_img
     );
     CHECK(cudaGetLastError());
-    CHECK(cudaDeviceSynchronize());
+    ////CHECK(cudaDeviceSynchronize());
 
     // 5. Copy kết quả tổng về CPU
     float h_sum;
@@ -101,7 +101,7 @@ Tensor MSELoss::backward() {
         scale
     );
     CHECK(cudaGetLastError());
-    CHECK(cudaDeviceSynchronize());
+    //CHECK(cudaDeviceSynchronize());
 
     return dInput;
 }
