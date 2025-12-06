@@ -1,0 +1,206 @@
+#include "layers/Conv2D.h"
+#include "core/CheckError.h"
+#include "core/Tensor.h"
+#include <cuda_runtime.h>
+
+namespace {
+
+// --- OPTIMIZED FORWARD KERNEL (Grid Z = Batch) ---
+__global__ void k_conv2d_fwd_opt(
+    const float* __restrict__ in, 
+    const float* __restrict__ k, 
+    const float* __restrict__ b, 
+    float* __restrict__ out,
+    int C_in, int H_in, int W_in, 
+    int C_out, int H_out, int W_out, 
+    int K_size, int stride, int padding) 
+{
+    // 1. Batch Index từ Grid Z
+    int n = blockIdx.z; 
+
+    // 2. Linear Index trong 1 ảnh từ Grid X
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // Số phần tử của 1 ảnh Output
+    int vol_one_img = C_out * H_out * W_out;
+
+    if (idx >= vol_one_img) return;
+
+    // 3. Giải mã nhanh (FIXED)
+    int ow = idx % W_out;
+    int tmp = idx / W_out;
+    int oh = tmp % H_out;
+    int oc = tmp / H_out; 
+
+    // 4. Tính Offset
+    int in_offset_batch = n * (C_in * H_in * W_in);
+    int out_global_idx = n * vol_one_img + idx;
+
+    float sum = b[oc]; // Truy cập bias an toàn sau khi sửa oc
+
+    // Dời con trỏ đến đúng ảnh trong batch
+    const float* in_img = in + in_offset_batch;
+
+    for (int ic = 0; ic < C_in; ++ic) {
+        int in_offset_c = ic * H_in * W_in;
+        int k_offset_c  = oc * (C_in * K_size * K_size) + ic * (K_size * K_size);
+
+        for (int kh = 0; kh < K_size; ++kh) {
+            for (int kw = 0; kw < K_size; ++kw) {
+                int h_in = oh * stride - padding + kh;
+                int w_in = ow * stride - padding + kw;
+                
+                if (h_in >= 0 && h_in < H_in && w_in >= 0 && w_in < W_in) {
+                    int in_idx = in_offset_c + h_in * W_in + w_in;
+                    int k_idx  = k_offset_c + kh * K_size + kw;
+                    sum += in_img[in_idx] * k[k_idx];
+                }
+            }
+        }
+    }
+    out[out_global_idx] = sum;
+}
+
+// --- OPTIMIZED BACKWARD KERNEL ---
+__global__ void k_conv2d_bwd_opt(
+    const float* __restrict__ in, 
+    const float* __restrict__ k, 
+    const float* __restrict__ grad_out,
+    float* __restrict__ grad_in, 
+    float* __restrict__ grad_k, 
+    float* __restrict__ grad_b,
+    int C_in, int H_in, int W_in, 
+    int C_out, int H_out, int W_out, 
+    int K_size, int stride, int padding) 
+{
+    int n = blockIdx.z; // Batch
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int vol_one_img = C_out * H_out * W_out;
+
+    if (idx >= vol_one_img) return;
+
+    int ow = idx % W_out;
+    int tmp = idx / W_out;
+    int oh = tmp % H_out;
+    int oc = tmp / H_out; 
+
+    int in_offset_batch = n * (C_in * H_in * W_in);
+    int go_global_idx = n * vol_one_img + idx;
+
+    float go_val = grad_out[go_global_idx];
+
+    // Atomic Add cho Bias
+    atomicAdd(&grad_b[oc], go_val);
+
+    const float* in_img = in + in_offset_batch;
+    float* gi_img = grad_in + in_offset_batch;
+
+    for (int ic = 0; ic < C_in; ++ic) {
+        int in_offset_c = ic * H_in * W_in;
+        int k_offset_c  = oc * (C_in * K_size * K_size) + ic * (K_size * K_size);
+
+        for (int kh = 0; kh < K_size; ++kh) {
+            for (int kw = 0; kw < K_size; ++kw) {
+                int h_in = oh * stride - padding + kh;
+                int w_in = ow * stride - padding + kw;
+                
+                if (h_in >= 0 && h_in < H_in && w_in >= 0 && w_in < W_in) {
+                    int in_idx = in_offset_c + h_in * W_in + w_in;
+                    int k_idx  = k_offset_c + kh * K_size + kw;
+                    
+                    atomicAdd(&grad_k[k_idx], in_img[in_idx] * go_val);
+                    atomicAdd(&gi_img[in_idx], k[k_idx] * go_val);
+                }
+            }
+        }
+    }
+}
+} // namespace
+
+// ======================================================================
+// 2. IMPLEMENTATION 
+// ======================================================================
+
+Conv2D::Conv2D(int in, int out, int k, int s, int p) 
+    : in_c(in), out_c(out), k_size(k), stride(s), padding(p) 
+{
+    W = Tensor::randn({out, in, k, k}, 0.0f, 0.01f, DeviceType::CUDA);
+    b = Tensor::zeros({out}, DeviceType::CUDA);
+    W.requires_grad = true; b.requires_grad = true;
+}
+
+Tensor Conv2D::forward(const Tensor& input) {
+    input_cache = input.to(DeviceType::CUDA);
+    
+    int N = input_cache.sizes[0];
+    int H = input_cache.sizes[2]; 
+    int W_in = input_cache.sizes[3];
+    int H_out = (H + 2*padding - k_size) / stride + 1;
+    int W_out = (W_in + 2*padding - k_size) / stride + 1;
+
+    Tensor out = Tensor::empty({N, out_c, H_out, W_out}, DeviceType::CUDA);
+
+    // --- CONFIG GRID 3D ---
+    int vol_one_img = out_c * H_out * W_out;
+    int threads = 256;
+    int blocks_x = (vol_one_img + threads - 1) / threads;
+    
+    dim3 grid(blocks_x, 1, N); 
+    dim3 block(threads, 1, 1);
+
+    k_conv2d_fwd_opt<<<grid, block>>>(
+        (const float*)input_cache.data_ptr(), 
+        (const float*)W.data_ptr(), 
+        (const float*)b.data_ptr(), 
+        (float*)out.data_ptr(),
+        in_c, H, W_in, 
+        out_c, H_out, W_out, 
+        k_size, stride, padding
+    );
+    CHECK(cudaGetLastError());
+    //CHECK(cudaDeviceSynchronize());
+    return out;
+}
+
+Tensor Conv2D::backward(const Tensor& grad_output) {
+    Tensor grad_out_gpu = grad_output.to(DeviceType::CUDA);
+    if(!W.grad) W.ensure_grad();
+    if(!b.grad) b.ensure_grad();
+    
+    Tensor dIn = Tensor::zeros(input_cache.sizes, DeviceType::CUDA);
+    W.zero_grad();
+    b.zero_grad();
+
+    int N = input_cache.sizes[0];
+    int H = input_cache.sizes[2];
+    int W_in = input_cache.sizes[3];
+    int H_out = grad_out_gpu.sizes[2];
+    int W_out = grad_out_gpu.sizes[3];
+
+    int vol_one_img = out_c * H_out * W_out;
+    int threads = 256;
+    int blocks_x = (vol_one_img + threads - 1) / threads;
+    
+    dim3 grid(blocks_x, 1, N); 
+    dim3 block(threads, 1, 1);
+
+    k_conv2d_bwd_opt<<<grid, block>>>(
+        (const float*)input_cache.data_ptr(), 
+        (const float*)W.data_ptr(), 
+        (const float*)grad_out_gpu.data_ptr(),
+        (float*)dIn.data_ptr(), 
+        (float*)W.grad->data_ptr(), 
+        (float*)b.grad->data_ptr(),
+        in_c, H, W_in, 
+        out_c, H_out, W_out, 
+        k_size, stride, padding
+    );
+    CHECK(cudaGetLastError());
+    //CHECK(cudaDeviceSynchronize());
+    return dIn;
+}
+
+void Conv2D::to(DeviceType device){
+    W = W.to(device);
+    b = b.to(device);
+}

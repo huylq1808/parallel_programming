@@ -32,6 +32,13 @@ file(GLOB_RECURSE SRC_GPU_NAIVE
     "${CMAKE_SOURCE_DIR}/src/GPU_naive/*.cpp"
 )
 
+# optimize v2 
+file(GLOB_RECURSE SRC_GPU_OPT2 
+    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v2/*.cu" 
+    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v2/*.cuh"
+    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v2/*.cpp"
+)
+
 # ==============================================================================
 # 3. DEFINE LIBRARIES (TẠO CÁC PHIÊN BẢN THƯ VIỆN)
 # ==============================================================================
@@ -55,6 +62,21 @@ if(CMAKE_CUDA_COMPILER)
     message(STATUS ">> ENABLED: GPU Naive Backend")
 else()
     message(WARNING ">> CUDA NOT FOUND: GPU Backends will be disabled")
+endif()
+
+# --- C. Library: GPU Optimized V2 ---
+if(CMAKE_CUDA_COMPILER)
+    add_library(dl_gpu_opt2 STATIC ${SRC_GPU_OPT2})
+    find_package(CUDAToolkit REQUIRED)
+    # Link với thư viện CUDA runtime
+    target_link_libraries(dl_gpu_opt2 PUBLIC CUDA::cudart CUDA::cublas) 
+
+    target_compile_definitions(dl_gpu_opt2 PUBLIC 
+        USE_GPU_OPT2_BACKEND 
+        USE_CUDA 
+    )
+    
+    message(STATUS ">> ENABLED: GPU Optimized V2 Backend")
 endif()
 
 # --- C. Library: GPU Optimized V1 (Template cho tương lai) ---
@@ -87,4 +109,10 @@ if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/train_gpu_naive.cpp"
     message(STATUS "   + Added Target: train_net_gpu_naive")
 endif()
 
-
+# --- APP 3: TRAIN GPU Optimized V2 (train_net_gpu_opt2) ---
+# Dùng code GPU riêng, link với thư viện dl_gpu_opt2
+if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/train_gpu_naive.cpp")
+    add_executable(train_net_gpu_opt2 apps/train_gpu_naive.cpp)
+    target_link_libraries(train_net_gpu_opt2 PRIVATE dl_gpu_opt2)
+    message(STATUS "   + Added Target: train_net_gpu_opt2")
+endif()
