@@ -111,8 +111,8 @@ endif()
 
 # --- APP 3: TRAIN GPU Optimized V2 (train_net_gpu_opt2) ---
 # Dùng code GPU riêng, link với thư viện dl_gpu_opt2
-if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/train_gpu_naive.cpp")
-    add_executable(train_net_gpu_opt2 apps/train_gpu_naive.cpp)
+if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/train_gpu_opt_v2.cpp")
+    add_executable(train_net_gpu_opt2 apps/train_gpu_opt_v2.cpp)
     target_link_libraries(train_net_gpu_opt2 PRIVATE dl_gpu_opt2)
     message(STATUS "   + Added Target: train_net_gpu_opt2")
 endif()

@@ -9,15 +9,14 @@
 #include "optim/SGD.h"
 #include "dataloader/CifarDataLoader.h"
 #include "utils/Serializer.h"
-#include "models/Autoencoder.h"
-
+#include "models/Autoencoder_v2.h"
 
 #ifndef USE_CUDA
 #error "This file requires CUDA to be enabled in CMake!"
 #endif
 
 // Hàm Validation GPU
-float validate(Autoencoder& model, CifarDataLoader& loader, MSELoss& criterion) {
+float validate(Autoencoder_v2& model, CifarDataLoader& loader, MSELoss& criterion) {
     loader.startEpoch(false);
     float total_loss = 0.0f;
     int steps = 0;
@@ -52,7 +51,7 @@ int main() {
     CifarDataLoader trainLoader(data_path, CifarDataLoader::Split::Train, batch_size, train_samples);
     CifarDataLoader valLoader(data_path, CifarDataLoader::Split::Test, batch_size, val_samples);
 
-    Autoencoder model;
+    Autoencoder_v2 model;
     // 1. Chuyển Model sang GPU ngay lập tức
     model.to(DeviceType::CUDA); 
 
@@ -93,6 +92,7 @@ int main() {
         }
         
         float avg_val_loss = validate(model, valLoader, criterion);
+        cudaDeviceSynchronize();
         auto t_end = std::chrono::high_resolution_clock::now();
         
         std::cout << "\rEpoch [" << epoch+1 << "/" << epochs << "] "

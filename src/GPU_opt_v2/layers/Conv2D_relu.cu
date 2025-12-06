@@ -1,12 +1,12 @@
-#include "layers/Conv2D.h"
+#include "layers/Conv2D_relu.h"
 #include "core/CheckError.h"
 #include "core/Tensor.h"
 #include <cuda_runtime.h>
 
 namespace {
 
-// --- OPTIMIZED FORWARD KERNEL (Grid Z = Batch) ---
-__global__ void k_conv2d_fwd_opt(
+// --- FUSED FORWARD KERNEL (Conv + Bias + ReLU) ---
+__global__ void k_conv2d_relu_fwd(
     const float* __restrict__ in, 
     const float* __restrict__ k, 
     const float* __restrict__ b, 
@@ -15,30 +15,21 @@ __global__ void k_conv2d_fwd_opt(
     int C_out, int H_out, int W_out, 
     int K_size, int stride, int padding) 
 {
-    // 1. Batch Index từ Grid Z
     int n = blockIdx.z; 
-
-    // 2. Linear Index trong 1 ảnh từ Grid X
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    // Số phần tử của 1 ảnh Output
     int vol_one_img = C_out * H_out * W_out;
 
     if (idx >= vol_one_img) return;
 
-    // 3. Giải mã nhanh (FIXED)
     int ow = idx % W_out;
     int tmp = idx / W_out;
     int oh = tmp % H_out;
     int oc = tmp / H_out; 
 
-    // 4. Tính Offset
     int in_offset_batch = n * (C_in * H_in * W_in);
     int out_global_idx = n * vol_one_img + idx;
 
-    float sum = b[oc]; // Truy cập bias an toàn sau khi sửa oc
-
-    // Dời con trỏ đến đúng ảnh trong batch
+    float sum = b[oc]; 
     const float* in_img = in + in_offset_batch;
 
     for (int ic = 0; ic < C_in; ++ic) {
@@ -58,14 +49,17 @@ __global__ void k_conv2d_fwd_opt(
             }
         }
     }
-    out[out_global_idx] = sum;
+    
+    // --- FUSION: APPLY RELU HERE ---
+    out[out_global_idx] = (sum > 0.0f) ? sum : 0.0f;
 }
 
-// --- OPTIMIZED BACKWARD KERNEL ---
-__global__ void k_conv2d_bwd_opt(
+// --- FUSED BACKWARD KERNEL ---
+__global__ void k_conv2d_relu_bwd(
     const float* __restrict__ in, 
     const float* __restrict__ k, 
     const float* __restrict__ grad_out,
+    const float* __restrict__ fwd_out, // Cần output của forward để check điều kiện ReLU
     float* __restrict__ grad_in, 
     float* __restrict__ grad_k, 
     float* __restrict__ grad_b,
@@ -73,7 +67,7 @@ __global__ void k_conv2d_bwd_opt(
     int C_out, int H_out, int W_out, 
     int K_size, int stride, int padding) 
 {
-    int n = blockIdx.z; // Batch
+    int n = blockIdx.z;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int vol_one_img = C_out * H_out * W_out;
 
@@ -85,9 +79,19 @@ __global__ void k_conv2d_bwd_opt(
     int oc = tmp / H_out; 
 
     int in_offset_batch = n * (C_in * H_in * W_in);
-    int go_global_idx = n * vol_one_img + idx;
+    int global_idx = n * vol_one_img + idx;
 
-    float go_val = grad_out[go_global_idx];
+    // Lấy gradient từ layer phía sau
+    float go_val = grad_out[global_idx];
+
+    // --- FUSION: RELU BACKWARD LOGIC ---
+    // Nếu output forward tại vị trí này <= 0, gradient bị triệt tiêu
+    if (fwd_out[global_idx] <= 0.0f) {
+        go_val = 0.0f;
+    }
+
+    // Nếu go_val == 0 thì không cần tính tiếp (Optimization)
+    if (go_val == 0.0f) return;
 
     // Atomic Add cho Bias
     atomicAdd(&grad_b[oc], go_val);
@@ -118,18 +122,19 @@ __global__ void k_conv2d_bwd_opt(
 } // namespace
 
 // ======================================================================
-// 2. IMPLEMENTATION 
+// IMPLEMENTATION 
 // ======================================================================
 
-Conv2D::Conv2D(int in, int out, int k, int s, int p) 
+Conv2D_relu::Conv2D_relu(int in, int out, int k, int s, int p) 
     : in_c(in), out_c(out), k_size(k), stride(s), padding(p) 
 {
+    // Init trọng số giống Conv2D thường
     W = Tensor::randn({out, in, k, k}, 0.0f, 0.5f, DeviceType::CUDA);
     b = Tensor::zeros({out}, DeviceType::CUDA);
     W.requires_grad = true; b.requires_grad = true;
 }
 
-Tensor Conv2D::forward(const Tensor& input) {
+Tensor Conv2D_relu::forward(const Tensor& input) {
     input_cache = input.to(DeviceType::CUDA);
     
     int N = input_cache.sizes[0];
@@ -138,9 +143,9 @@ Tensor Conv2D::forward(const Tensor& input) {
     int H_out = (H + 2*padding - k_size) / stride + 1;
     int W_out = (W_in + 2*padding - k_size) / stride + 1;
 
-    Tensor out = Tensor::empty({N, out_c, H_out, W_out}, DeviceType::CUDA);
+    // Tạo output tensor
+    out_cache = Tensor::empty({N, out_c, H_out, W_out}, DeviceType::CUDA);
 
-    // --- CONFIG GRID 3D ---
     int vol_one_img = out_c * H_out * W_out;
     int threads = 256;
     int blocks_x = (vol_one_img + threads - 1) / threads;
@@ -148,21 +153,22 @@ Tensor Conv2D::forward(const Tensor& input) {
     dim3 grid(blocks_x, 1, N); 
     dim3 block(threads, 1, 1);
 
-    k_conv2d_fwd_opt<<<grid, block>>>(
+    // Gọi Fused Kernel
+    k_conv2d_relu_fwd<<<grid, block>>>(
         (const float*)input_cache.data_ptr(), 
         (const float*)W.data_ptr(), 
         (const float*)b.data_ptr(), 
-        (float*)out.data_ptr(),
+        (float*)out_cache.data_ptr(),
         in_c, H, W_in, 
         out_c, H_out, W_out, 
         k_size, stride, padding
     );
     CHECK(cudaGetLastError());
-    //CHECK(cudaDeviceSynchronize());
-    return out;
+    
+    return out_cache; // Trả về kết quả đã qua ReLU
 }
 
-Tensor Conv2D::backward(const Tensor& grad_output) {
+Tensor Conv2D_relu::backward(const Tensor& grad_output) {
     Tensor grad_out_gpu = grad_output.to(DeviceType::CUDA);
     if(!W.grad) W.ensure_grad();
     if(!b.grad) b.ensure_grad();
@@ -184,10 +190,11 @@ Tensor Conv2D::backward(const Tensor& grad_output) {
     dim3 grid(blocks_x, 1, N); 
     dim3 block(threads, 1, 1);
 
-    k_conv2d_bwd_opt<<<grid, block>>>(
+    k_conv2d_relu_bwd<<<grid, block>>>(
         (const float*)input_cache.data_ptr(), 
         (const float*)W.data_ptr(), 
         (const float*)grad_out_gpu.data_ptr(),
+        (const float*)out_cache.data_ptr(), // Truyền output fwd vào để check mask
         (float*)dIn.data_ptr(), 
         (float*)W.grad->data_ptr(), 
         (float*)b.grad->data_ptr(),
@@ -196,11 +203,11 @@ Tensor Conv2D::backward(const Tensor& grad_output) {
         k_size, stride, padding
     );
     CHECK(cudaGetLastError());
-    //CHECK(cudaDeviceSynchronize());
+    
     return dIn;
 }
 
-void Conv2D::to(DeviceType device){
+void Conv2D_relu::to(DeviceType device){
     W = W.to(device);
     b = b.to(device);
 }

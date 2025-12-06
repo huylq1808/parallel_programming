@@ -138,7 +138,7 @@ Tensor Tensor::matmul(const Tensor& other) const {
             (float*)out.data_ptr(),
             M, sizes[1], N
         );
-        CHECK(cudaDeviceSynchronize());
+        //CHECK(cudaDeviceSynchronize());
 
     }
     #endif
@@ -170,7 +170,7 @@ Tensor Tensor::add(const Tensor& other) const {
             (float*)out.data_ptr(),
             n
         );
-        CHECK(cudaDeviceSynchronize());
+        //CHECK(cudaDeviceSynchronize());
     }
     #endif
 
