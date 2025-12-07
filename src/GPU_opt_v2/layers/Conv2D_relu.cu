@@ -5,8 +5,8 @@
 
 namespace {
 
-// --- FUSED FORWARD KERNEL (Conv + Bias + ReLU) ---
-__global__ void k_conv2d_relu_fwd(
+// --- FORWARD (Fused) ---
+__global__ void k_conv2d_relu_fwd_opt(
     const float* __restrict__ in, 
     const float* __restrict__ k, 
     const float* __restrict__ b, 
@@ -35,34 +35,68 @@ __global__ void k_conv2d_relu_fwd(
     for (int ic = 0; ic < C_in; ++ic) {
         int in_offset_c = ic * H_in * W_in;
         int k_offset_c  = oc * (C_in * K_size * K_size) + ic * (K_size * K_size);
-
+        
+        #pragma unroll
         for (int kh = 0; kh < K_size; ++kh) {
+          #pragma unroll
             for (int kw = 0; kw < K_size; ++kw) {
                 int h_in = oh * stride - padding + kh;
                 int w_in = ow * stride - padding + kw;
                 
                 if (h_in >= 0 && h_in < H_in && w_in >= 0 && w_in < W_in) {
-                    int in_idx = in_offset_c + h_in * W_in + w_in;
-                    int k_idx  = k_offset_c + kh * K_size + kw;
-                    sum += in_img[in_idx] * k[k_idx];
+                    sum += in_img[in_offset_c + h_in * W_in + w_in] * k[k_offset_c + kh * K_size + kw];
                 }
             }
         }
     }
-    
-    // --- FUSION: APPLY RELU HERE ---
+    // ReLU
     out[out_global_idx] = (sum > 0.0f) ? sum : 0.0f;
 }
 
-// --- FUSED BACKWARD KERNEL ---
-__global__ void k_conv2d_relu_bwd(
+// --- OPTIMIZED BIAS BACKWARD (With ReLU Check) ---
+__global__ void k_conv2d_relu_bwd_bias(
+    const float* __restrict__ grad_out, 
+    const float* __restrict__ fwd_out, // Needed for ReLU mask
+    float* __restrict__ grad_b, 
+    int N, int C_out, int H_out, int W_out) 
+{
+    int oc = blockIdx.x; 
+    if (oc >= C_out) return;
+
+    int vol_channel = H_out * W_out;
+    int total_elements = N * vol_channel; 
+
+    float local_sum = 0.0f;
+
+    for (int i = threadIdx.x; i < total_elements; i += blockDim.x) {
+        int n = i / vol_channel;
+        int rem = i % vol_channel;
+        int idx = n * (C_out * vol_channel) + oc * vol_channel + rem;
+        
+        // FUSED RELU CHECK: Only accumulate if forward output > 0
+        if (fwd_out[idx] > 0.0f) {
+            local_sum += grad_out[idx];
+        }
+    }
+
+    // Warp Reduction
+    for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
+    }
+
+    if (threadIdx.x % 32 == 0) {
+        atomicAdd(&grad_b[oc], local_sum);
+    }
+}
+
+// --- OPTIMIZED DATA/WEIGHT BACKWARD (With ReLU Check) ---
+__global__ void k_conv2d_relu_bwd_data_weights(
     const float* __restrict__ in, 
     const float* __restrict__ k, 
     const float* __restrict__ grad_out,
-    const float* __restrict__ fwd_out, // Cần output của forward để check điều kiện ReLU
+    const float* __restrict__ fwd_out,
     float* __restrict__ grad_in, 
     float* __restrict__ grad_k, 
-    float* __restrict__ grad_b,
     int C_in, int H_in, int W_in, 
     int C_out, int H_out, int W_out, 
     int K_size, int stride, int padding) 
@@ -81,20 +115,14 @@ __global__ void k_conv2d_relu_bwd(
     int in_offset_batch = n * (C_in * H_in * W_in);
     int global_idx = n * vol_one_img + idx;
 
-    // Lấy gradient từ layer phía sau
     float go_val = grad_out[global_idx];
 
-    // --- FUSION: RELU BACKWARD LOGIC ---
-    // Nếu output forward tại vị trí này <= 0, gradient bị triệt tiêu
+    // FUSED RELU CHECK
     if (fwd_out[global_idx] <= 0.0f) {
-        go_val = 0.0f;
+        return; // Gradient killed by ReLU
     }
-
-    // Nếu go_val == 0 thì không cần tính tiếp (Optimization)
-    if (go_val == 0.0f) return;
-
-    // Atomic Add cho Bias
-    atomicAdd(&grad_b[oc], go_val);
+    // Additional optimization for sparsity
+    if (abs(go_val) < 1e-9) return;
 
     const float* in_img = in + in_offset_batch;
     float* gi_img = grad_in + in_offset_batch;
@@ -103,7 +131,9 @@ __global__ void k_conv2d_relu_bwd(
         int in_offset_c = ic * H_in * W_in;
         int k_offset_c  = oc * (C_in * K_size * K_size) + ic * (K_size * K_size);
 
+        #pragma unroll
         for (int kh = 0; kh < K_size; ++kh) {
+            #pragma unroll
             for (int kw = 0; kw < K_size; ++kw) {
                 int h_in = oh * stride - padding + kh;
                 int w_in = ow * stride - padding + kw;
@@ -128,7 +158,6 @@ __global__ void k_conv2d_relu_bwd(
 Conv2D_relu::Conv2D_relu(int in, int out, int k, int s, int p) 
     : in_c(in), out_c(out), k_size(k), stride(s), padding(p) 
 {
-    // Init trọng số giống Conv2D thường
     W = Tensor::randn({out, in, k, k}, 0.0f, 0.5f, DeviceType::CUDA);
     b = Tensor::zeros({out}, DeviceType::CUDA);
     W.requires_grad = true; b.requires_grad = true;
@@ -136,36 +165,26 @@ Conv2D_relu::Conv2D_relu(int in, int out, int k, int s, int p)
 
 Tensor Conv2D_relu::forward(const Tensor& input) {
     input_cache = input.to(DeviceType::CUDA);
-    
     int N = input_cache.sizes[0];
     int H = input_cache.sizes[2]; 
     int W_in = input_cache.sizes[3];
     int H_out = (H + 2*padding - k_size) / stride + 1;
     int W_out = (W_in + 2*padding - k_size) / stride + 1;
 
-    // Tạo output tensor
     out_cache = Tensor::empty({N, out_c, H_out, W_out}, DeviceType::CUDA);
 
     int vol_one_img = out_c * H_out * W_out;
     int threads = 256;
     int blocks_x = (vol_one_img + threads - 1) / threads;
-    
     dim3 grid(blocks_x, 1, N); 
     dim3 block(threads, 1, 1);
 
-    // Gọi Fused Kernel
-    k_conv2d_relu_fwd<<<grid, block>>>(
-        (const float*)input_cache.data_ptr(), 
-        (const float*)W.data_ptr(), 
-        (const float*)b.data_ptr(), 
-        (float*)out_cache.data_ptr(),
-        in_c, H, W_in, 
-        out_c, H_out, W_out, 
-        k_size, stride, padding
+    k_conv2d_relu_fwd_opt<<<grid, block>>>(
+        (const float*)input_cache.data_ptr(), (const float*)W.data_ptr(), (const float*)b.data_ptr(), (float*)out_cache.data_ptr(),
+        in_c, H, W_in, out_c, H_out, W_out, k_size, stride, padding
     );
     CHECK(cudaGetLastError());
-    
-    return out_cache; // Trả về kết quả đã qua ReLU
+    return out_cache;
 }
 
 Tensor Conv2D_relu::backward(const Tensor& grad_output) {
@@ -183,27 +202,32 @@ Tensor Conv2D_relu::backward(const Tensor& grad_output) {
     int H_out = grad_out_gpu.sizes[2];
     int W_out = grad_out_gpu.sizes[3];
 
+    // 1. Bias Backward (With ReLU logic)
+    int threads_bias = 256;
+    k_conv2d_relu_bwd_bias<<<out_c, threads_bias>>>(
+        (const float*)grad_out_gpu.data_ptr(),
+        (const float*)out_cache.data_ptr(), // Fwd output for mask
+        (float*)b.grad->data_ptr(),
+        N, out_c, H_out, W_out
+    );
+
+    // 2. Data/Weights Backward
     int vol_one_img = out_c * H_out * W_out;
     int threads = 256;
     int blocks_x = (vol_one_img + threads - 1) / threads;
-    
     dim3 grid(blocks_x, 1, N); 
     dim3 block(threads, 1, 1);
 
-    k_conv2d_relu_bwd<<<grid, block>>>(
+    k_conv2d_relu_bwd_data_weights<<<grid, block>>>(
         (const float*)input_cache.data_ptr(), 
         (const float*)W.data_ptr(), 
         (const float*)grad_out_gpu.data_ptr(),
-        (const float*)out_cache.data_ptr(), // Truyền output fwd vào để check mask
+        (const float*)out_cache.data_ptr(),
         (float*)dIn.data_ptr(), 
         (float*)W.grad->data_ptr(), 
-        (float*)b.grad->data_ptr(),
-        in_c, H, W_in, 
-        out_c, H_out, W_out, 
-        k_size, stride, padding
+        in_c, H, W_in, out_c, H_out, W_out, k_size, stride, padding
     );
     CHECK(cudaGetLastError());
-    
     return dIn;
 }
 
