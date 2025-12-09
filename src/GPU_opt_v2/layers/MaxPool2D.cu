@@ -5,11 +5,7 @@
 
 namespace {
 
-// ======================================================================
 // 1. KERNEL FLOAT4 - 2 OUTPUTS PER THREAD
-// Chiến lược: 1 Thread đọc 2 float4 (Input) -> Tính ra 2 float (Output)
-// Yêu cầu: Kernel=2, Stride=2, Input Width % 4 == 0
-// ======================================================================
 __global__ void k_maxpool_fwd_2out_vec4(
     const float* __restrict__ in, 
     float* __restrict__ out, 
@@ -54,8 +50,8 @@ __global__ void k_maxpool_fwd_2out_vec4(
     const float4* row1_ptr = (const float4*)(in + img_offset + (h_in + 1) * W_in + w_in);
 
     // --- 3. LOAD DỮ LIỆU (CHỈ 2 LẦN ĐỌC) ---
-    float4 v0 = *row0_ptr; // Chứa: Row0[0], Row0[1], Row0[2], Row0[3]
-    float4 v1 = *row1_ptr; // Chứa: Row1[0], Row1[1], Row1[2], Row1[3]
+    float4 v0 = *row0_ptr; // Row0[0], Row0[1], Row0[2], Row0[3]
+    float4 v1 = *row1_ptr; // Row1[0], Row1[1], Row1[2], Row1[3]
 
     // --- 4. TÍNH TOÁN POOLING (DÙNG THANH GHI) ---
     // Base index để tính chỉ số Max (cho Backward)
@@ -89,9 +85,7 @@ __global__ void k_maxpool_fwd_2out_vec4(
     indices[out_global_idx + 1] = (float)(base_idx_global + midx2);
 }
 
-// ======================================================================
 // KERNEL FALLBACK & BACKWARD (GIỮ NGUYÊN)
-// ======================================================================
 __global__ void k_maxpool_fwd_scalar(
     const float* in, float* out, float* indices,
     int C, int H, int W, int H_out, int W_out, int k, int s) 
@@ -134,13 +128,51 @@ __global__ void k_maxpool_fwd_scalar(
     indices[out_idx] = (float)max_idx;
 }
 
-__global__ void k_maxpool_bwd_opt(const float* grad_out, const float* indices, float* grad_in, int vol_one_img) {
-    int n = blockIdx.z;
+
+
+__global__ void k_maxpool_bwd_gather_opt(
+    const float* __restrict__ grad_out, 
+    const float* __restrict__ indices, 
+    float* __restrict__ grad_in, 
+    int C, int H_in, int W_in, 
+    int H_out, int W_out) 
+{
+    // idx map trực tiếp vào INPUT PIXEL
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < vol_one_img) {
-        int gid = n * vol_one_img + idx;
-        int max_idx = (int)indices[gid];
-        if (max_idx != -1) atomicAdd(&grad_in[max_idx], grad_out[gid]);
+    int vol_in = C * H_in * W_in;
+    int n = blockIdx.z;
+
+    if (idx >= vol_in) return;
+
+    // 1. Map idx về tọa độ Input (c, h_in, w_in)
+    int w_in = idx % W_in;
+    int tmp = idx / W_in;
+    int h_in = tmp % H_in;
+    int c = tmp / H_in;
+
+    // 2. Tính tọa độ Output tương ứng (h_out, w_out)
+    int h_out = h_in / 2;
+    int w_out = w_in / 2;
+
+    // Kiểm tra biên Output (để an toàn, dù với stride 2 thường sẽ khớp)
+    if (h_out < H_out && w_out < W_out) {
+        int global_in_idx = n * vol_in + idx;
+        
+        // 3. Đọc Max Index đã lưu từ Forward
+        int out_idx = n * (C * H_out * W_out) + c * (H_out * W_out) + h_out * W_out + w_out;
+        int max_idx_stored = (int)indices[out_idx];
+
+        // 4. So sánh và Ghi kết quả (Gather)
+        // Nếu pixel input hiện tại (global_in_idx) chính là pixel max được lưu
+        if (max_idx_stored == global_in_idx) {
+            grad_in[global_in_idx] = grad_out[out_idx];
+        } else {
+            grad_in[global_in_idx] = 0.0f;
+        }
+    } else {
+        // Pixel input nằm ngoài vùng pooling (padding hoặc lẻ biên)
+        int global_in_idx = n * vol_in + idx;
+        grad_in[global_in_idx] = 0.0f;
     }
 }
 } // namespace
@@ -166,9 +198,6 @@ Tensor MaxPool2D::forward(const Tensor& input) {
     int vol_one_img = C * H_out * W_out;
 
     // --- KIỂM TRA ĐIỀU KIỆN DÙNG KERNEL TỐI ƯU ---
-    // 1. Kernel 2x2, Stride 2
-    // 2. Input Width phải chia hết cho 4 (để cast float4* an toàn tại mọi vị trí 2*ow)
-    //    Hoặc chặt chẽ hơn: W_out phải chẵn (vì ta xử lý từng cặp output)
     bool is_optimized = (kernel_size == 2 && stride == 2 && (W % 4 == 0) && (W_out % 2 == 0));
 
     if (is_optimized) {
@@ -203,18 +232,30 @@ Tensor MaxPool2D::backward(const Tensor& grad_output) {
     Tensor grad_out_gpu = grad_output.to(DeviceType::CUDA);
     Tensor dX = Tensor::zeros(input_shape_cache, DeviceType::CUDA);
 
-    int vol_img = grad_out_gpu.sizes[1] * grad_out_gpu.sizes[2] * grad_out_gpu.sizes[3];
-    int N = grad_out_gpu.sizes[0];
+    // Kích thước Input
+    int N = dX.sizes[0];
+    int C = dX.sizes[1]; 
+    int H_in = dX.sizes[2]; 
+    int W_in = dX.sizes[3];
     
-    int threads = 256;
-    int blocks = (vol_img + threads - 1) / threads;
+    // Kích thước Output
+    int H_out = grad_out_gpu.sizes[2];
+    int W_out = grad_out_gpu.sizes[3];
 
-    k_maxpool_bwd_opt<<<dim3(blocks, 1, N), threads>>>(
+    int vol_input_one_img = C * H_in * W_in; // Grid theo INPUT size
+    int threads = 256;
+    int blocks = (vol_input_one_img + threads - 1) / threads;
+
+    // Kiểm tra điều kiện tối ưu (Kernel 2, Stride 2)
+   
+    k_maxpool_bwd_gather_opt<<<dim3(blocks, 1, N), threads>>>(
         (const float*)grad_out_gpu.data_ptr(), 
         (const float*)indices_cache.data_ptr(), 
         (float*)dX.data_ptr(), 
-        vol_img
+        C, H_in, W_in, H_out, W_out
     );
+    
+
     CHECK(cudaGetLastError());
     return dX;
 }

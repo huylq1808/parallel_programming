@@ -75,27 +75,52 @@ __global__ void k_upsample_fwd_opt(const float* in, float* out,
     out[out_global_idx] = in[in_global_idx];
 }
 
-// --- BACKWARD (SCALAR - AtomicAdd) ---
-__global__ void k_upsample_bwd_opt(const float* grad_out, float* grad_in, 
-                               int C, int H, int W, int H_out, int W_out, int scale) 
+
+__global__ void k_upsample_bwd_gather(
+    const float* __restrict__ grad_out, 
+    float* __restrict__ grad_in, 
+    int C, int H_in, int W_in, 
+    int H_out, int W_out, int scale) 
 {
-    int n = blockIdx.z;
+    // Mỗi thread tính 1 pixel Input
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int vol_one_img = C * H_out * W_out;
-    if (idx >= vol_one_img) return;
-
-    int ow = idx % W_out;
-    int tmp = idx / W_out;
-    int oh = tmp % H_out;
-    int c = tmp / H_out; 
-
-    int in_h = oh / scale;
-    int in_w = ow / scale;
+    int vol_in = C * H_in * W_in;
     
-    int in_global_idx = n*(C*H*W) + c*(H*W) + in_h*W + in_w;
-    int out_global_idx = n*vol_one_img + idx;
-    
-    atomicAdd(&grad_in[in_global_idx], grad_out[out_global_idx]);
+    if (idx >= vol_in) return;
+
+    int n = blockIdx.z;
+
+    // Giải mã tọa độ Input
+    int w_in = idx % W_in;
+    int tmp = idx / W_in;
+    int h_in = tmp % H_in;
+    int c = tmp / H_in;
+
+    // Tọa độ gốc trên Output
+    int h_out_start = h_in * scale;
+    int w_out_start = w_in * scale;
+
+    float sum = 0.0f;
+
+    // Gom gradient từ vùng Scale x Scale
+    // Với scale=2, loop này chạy 4 lần. 
+    #pragma unroll
+    for (int y = 0; y < scale; ++y) {
+        #pragma unroll
+        for (int x = 0; x < scale; ++x) {
+            int h_out = h_out_start + y;
+            int w_out = w_out_start + x;
+            
+            if (h_out < H_out && w_out < W_out) {
+                int out_idx = n * (C * H_out * W_out) + c * (H_out * W_out) + h_out * W_out + w_out;
+                sum += grad_out[out_idx];
+            }
+        }
+    }
+
+    // Ghi trực tiếp (Không Atomic)
+    int in_idx = n * vol_in + idx;
+    grad_in[in_idx] = sum;
 }
 
 } // namespace
@@ -156,7 +181,7 @@ Tensor Upsample::backward(const Tensor& grad_output) {
     int blocks = (vol_out + threads - 1) / threads;
     dim3 grid(blocks, 1, N);
 
-    k_upsample_bwd_opt<<<grid, threads>>>(
+    k_upsample_bwd_gather<<<grid, threads>>>(
         (const float*)grad_out_gpu.data_ptr(), 
         (float*)dX.data_ptr(),
         C, H, W, H_out, W_out, scale_factor
