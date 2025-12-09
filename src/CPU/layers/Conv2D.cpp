@@ -7,7 +7,7 @@ Conv2D::Conv2D(int in, int out, int k, int s, int p)
     : in_c(in), out_c(out), k_size(k), stride(s), padding(p) 
 {
     // Khởi tạo weights trên CPU
-    W = Tensor::randn({out, in, k, k}, 0.0f, 0.01f);
+    W = Tensor::randn({out, in, k, k}, 0.0f, 0.08f);
     b = Tensor::zeros({out});
     W.requires_grad = true; 
     b.requires_grad = true;

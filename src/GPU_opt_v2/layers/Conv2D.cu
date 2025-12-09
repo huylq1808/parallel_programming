@@ -155,7 +155,7 @@ __global__ void k_conv2d_bwd_data_weights(
 Conv2D::Conv2D(int in, int out, int k, int s, int p) 
     : in_c(in), out_c(out), k_size(k), stride(s), padding(p) 
 {
-    W = Tensor::randn({out, in, k, k}, 0.0f, 0.5f, DeviceType::CUDA);
+    W = Tensor::randn({out, in, k, k}, 0.0f, 0.08f, DeviceType::CUDA);
     b = Tensor::zeros({out}, DeviceType::CUDA);
     W.requires_grad = true; b.requires_grad = true;
 }

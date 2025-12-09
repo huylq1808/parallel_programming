@@ -16,7 +16,7 @@ struct Tensor {
 
     // Factories
     static Tensor zeros(const std::vector<int64_t>& sizes, DeviceType dev = DeviceType::CPU);
-    static Tensor randn(const std::vector<int64_t>& sizes, float mean = 0.0f, float std = 1.0f, DeviceType dev = DeviceType::CPU);
+    static Tensor randn(const std::vector<int64_t>& sizes, float mean = 0.0f, float std = 0.08f, DeviceType dev = DeviceType::CPU);
     static Tensor empty(const std::vector<int64_t>& sizes, DeviceType dev = DeviceType::CPU);
     
     // Helpers
