@@ -20,21 +20,47 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 # 2. SOURCE COLLECTION (TỰ ĐỘNG GOM FILE)
 # ==============================================================================
 # Gom toàn bộ source của CPU Backend
-file(GLOB_RECURSE SRC_CPU 
-    "${CMAKE_SOURCE_DIR}/src/CPU/*.cpp" 
+file(GLOB_RECURSE SRC_CPU
+    "${CMAKE_SOURCE_DIR}/src/CPU/*.cpp"
     "${CMAKE_SOURCE_DIR}/src/CPU/*.h"
 )
 
 # Gom toàn bộ source của GPU Naive Backend
-file(GLOB_RECURSE SRC_GPU_NAIVE 
-    "${CMAKE_SOURCE_DIR}/src/GPU_naive/*.cu" 
+file(GLOB_RECURSE SRC_GPU_NAIVE
+    "${CMAKE_SOURCE_DIR}/src/GPU_naive/*.cu"
     "${CMAKE_SOURCE_DIR}/src/GPU_naive/*.cuh"
     "${CMAKE_SOURCE_DIR}/src/GPU_naive/*.cpp"
 )
 
-# optimize v2 
-file(GLOB_RECURSE SRC_GPU_OPT2 
-    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v2/*.cu" 
+# file(GLOB_RECURSE SRC_GPU_OPT1
+# "${CMAKE_SOURCE_DIR}/src/GPU_opt_v1/*.cu"
+# "${CMAKE_SOURCE_DIR}/src/GPU_opt_v1/*.cuh"
+# "${CMAKE_SOURCE_DIR}/src/GPU_opt_v1/*.cpp"
+# )
+
+# Use all GPU_naive sources as a base
+set(SRC_GPU_OPT1 ${SRC_GPU_NAIVE})
+
+# Remove the naive Tensor + Conv2D implementations
+list(REMOVE_ITEM SRC_GPU_OPT1
+
+    "${CMAKE_SOURCE_DIR}/src/GPU_naive/layers/Conv2D.cu"
+    "${CMAKE_SOURCE_DIR}/src/GPU_naive/core/Allocator.cpp"
+)
+
+# Add the optimized v1 versions instead
+list(APPEND SRC_GPU_OPT1
+
+    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v1/layers/Conv2D.cu"
+    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v1/kernels/im2col.cu"
+    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v1/core/Allocator.cpp"
+)
+
+# ----------------------------------------------------------------------------
+
+# optimize v2
+file(GLOB_RECURSE SRC_GPU_OPT2
+    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v2/*.cu"
     "${CMAKE_SOURCE_DIR}/src/GPU_opt_v2/*.cuh"
     "${CMAKE_SOURCE_DIR}/src/GPU_opt_v2/*.cpp"
 )
@@ -51,15 +77,33 @@ target_compile_definitions(dl_cpu PUBLIC USE_CPU_BACKEND)
 if(CMAKE_CUDA_COMPILER)
     add_library(dl_gpu_naive STATIC ${SRC_GPU_NAIVE})
     find_package(CUDAToolkit REQUIRED)
-    # Link với thư viện CUDA runtime
-    target_link_libraries(dl_gpu_naive PUBLIC CUDA::cudart CUDA::cublas) 
 
-    target_compile_definitions(dl_gpu_naive PUBLIC 
-        USE_GPU_NAIVE_BACKEND 
-        USE_CUDA 
+    # Link với thư viện CUDA runtime
+    target_link_libraries(dl_gpu_naive PUBLIC CUDA::cudart CUDA::cublas)
+
+    target_compile_definitions(dl_gpu_naive PUBLIC
+        USE_GPU_NAIVE_BACKEND
+        USE_CUDA
     )
-    
+
     message(STATUS ">> ENABLED: GPU Naive Backend")
+else()
+    message(WARNING ">> CUDA NOT FOUND: GPU Backends will be disabled")
+endif()
+
+if(CMAKE_CUDA_COMPILER)
+    add_library(dl_gpu_opt1 STATIC ${SRC_GPU_OPT1})
+    find_package(CUDAToolkit REQUIRED)
+
+    # Link với thư viện CUDA runtime
+    target_link_libraries(dl_gpu_opt1 PUBLIC CUDA::cudart CUDA::cublas)
+
+    target_compile_definitions(dl_gpu_opt1 PUBLIC
+        USE_GPU_OPT1_BACKEND
+        USE_CUDA
+    )
+
+    message(STATUS ">> ENABLED: GPU Optimized V1 Backend")
 else()
     message(WARNING ">> CUDA NOT FOUND: GPU Backends will be disabled")
 endif()
@@ -68,22 +112,29 @@ endif()
 if(CMAKE_CUDA_COMPILER)
     add_library(dl_gpu_opt2 STATIC ${SRC_GPU_OPT2})
     find_package(CUDAToolkit REQUIRED)
-    # Link với thư viện CUDA runtime
-    target_link_libraries(dl_gpu_opt2 PUBLIC CUDA::cudart CUDA::cublas) 
 
-    target_compile_definitions(dl_gpu_opt2 PUBLIC 
-        USE_GPU_OPT2_BACKEND 
-        USE_CUDA 
+    # Link với thư viện CUDA runtime
+    target_link_libraries(dl_gpu_opt2 PUBLIC CUDA::cudart CUDA::cublas)
+
+    target_compile_definitions(dl_gpu_opt2 PUBLIC
+        USE_GPU_OPT2_BACKEND
+        USE_CUDA
     )
-    
+
     message(STATUS ">> ENABLED: GPU Optimized V2 Backend")
+endif()
+
+if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/visualize.cpp")
+    add_executable(visualize apps/visualize.cpp)
+    target_link_libraries(visualize PRIVATE dl_gpu_opt1) 
+    message(STATUS "   + Added Target: visualize")
 endif()
 
 # --- C. Library: GPU Optimized V1 (Template cho tương lai) ---
 # if(EXISTS "${CMAKE_SOURCE_DIR}/src_gpu_opt1")
-#     file(GLOB_RECURSE SRC_GPU_OPT1 "src_gpu_opt1/*.cu")
-#     add_library(dl_gpu_opt1 STATIC ${SRC_GPU_OPT1})
-#     target_link_libraries(dl_gpu_opt1 PRIVATE CUDA::cudart)
+# file(GLOB_RECURSE SRC_GPU_OPT1 "src_gpu_opt1/*.cu")
+# add_library(dl_gpu_opt1 STATIC ${SRC_GPU_OPT1})
+# target_link_libraries(dl_gpu_opt1 PRIVATE CUDA::cudart)
 # endif()
 
 # ==============================================================================
@@ -107,6 +158,12 @@ if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/train_gpu_naive.cpp"
     add_executable(train_net_gpu_naive apps/train_gpu_naive.cpp)
     target_link_libraries(train_net_gpu_naive PRIVATE dl_gpu_naive)
     message(STATUS "   + Added Target: train_net_gpu_naive")
+endif()
+
+if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/train_gpu_opt_v1.cpp")
+    add_executable(train_net_gpu_opt1 apps/train_gpu_opt_v1.cpp)
+    target_link_libraries(train_net_gpu_opt1 PRIVATE dl_gpu_opt1)
+    message(STATUS "   + Added Target: train_net_gpu_opt1")
 endif()
 
 # --- APP 3: TRAIN GPU Optimized V2 (train_net_gpu_opt2) ---
