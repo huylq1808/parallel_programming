@@ -173,3 +173,10 @@ if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/train_gpu_opt_v2.cpp
     target_link_libraries(train_net_gpu_opt2 PRIVATE dl_gpu_opt2)
     message(STATUS "   + Added Target: train_net_gpu_opt2")
 endif()
+
+# --- APP: Feature Extraction ---
+if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/extract_features.cpp")
+    add_executable(extract_features apps/extract_features.cpp)
+    target_link_libraries(extract_features PRIVATE dl_gpu_opt1)
+    message(STATUS "   + Added Target: extract_features")
+endif()
