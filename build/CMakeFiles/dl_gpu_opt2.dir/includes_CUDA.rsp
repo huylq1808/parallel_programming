@@ -1,0 +1,1 @@
+-I/content/drive/MyDrive/parallel_programming/test_v1/build/parallel_programming/include -isystem "/usr/local/cuda/targets/x86_64-linux/include"

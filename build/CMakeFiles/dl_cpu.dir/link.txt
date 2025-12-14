@@ -1,0 +1,2 @@
+/usr/bin/ar qc libdl_cpu.a CMakeFiles/dl_cpu.dir/src/CPU/core/Allocator.cpp.o CMakeFiles/dl_cpu.dir/src/CPU/core/Storage.cpp.o CMakeFiles/dl_cpu.dir/src/CPU/core/Tensor.cpp.o CMakeFiles/dl_cpu.dir/src/CPU/layers/Conv2D.cpp.o CMakeFiles/dl_cpu.dir/src/CPU/layers/MaxPool2D.cpp.o CMakeFiles/dl_cpu.dir/src/CPU/layers/ReLU.cpp.o CMakeFiles/dl_cpu.dir/src/CPU/layers/Sigmoid.cpp.o CMakeFiles/dl_cpu.dir/src/CPU/layers/Upsample.cpp.o CMakeFiles/dl_cpu.dir/src/CPU/loss/MSELoss.cpp.o CMakeFiles/dl_cpu.dir/src/CPU/optim/SGD.cpp.o
+/usr/bin/ranlib libdl_cpu.a

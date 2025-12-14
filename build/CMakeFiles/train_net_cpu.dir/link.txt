@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -march=native -ffast-math -funroll-loops -O3 -DNDEBUG CMakeFiles/train_net_cpu.dir/apps/train_cpu.cpp.o -o train_net_cpu  libdl_cpu.a

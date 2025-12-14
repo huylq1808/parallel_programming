@@ -1,0 +1,11 @@
+/content/drive/MyDrive/parallel_programming/test_v1/build/parallel_programming/build/CMakeFiles/dl_cpu.dir
+/content/drive/MyDrive/parallel_programming/test_v1/build/parallel_programming/build/CMakeFiles/dl_gpu_naive.dir
+/content/drive/MyDrive/parallel_programming/test_v1/build/parallel_programming/build/CMakeFiles/dl_gpu_opt1.dir
+/content/drive/MyDrive/parallel_programming/test_v1/build/parallel_programming/build/CMakeFiles/dl_gpu_opt2.dir
+/content/drive/MyDrive/parallel_programming/test_v1/build/parallel_programming/build/CMakeFiles/train_net_cpu.dir
+/content/drive/MyDrive/parallel_programming/test_v1/build/parallel_programming/build/CMakeFiles/train_net_gpu_naive.dir
+/content/drive/MyDrive/parallel_programming/test_v1/build/parallel_programming/build/CMakeFiles/train_net_gpu_opt1.dir
+/content/drive/MyDrive/parallel_programming/test_v1/build/parallel_programming/build/CMakeFiles/train_net_gpu_opt2.dir
+/content/drive/MyDrive/parallel_programming/test_v1/build/parallel_programming/build/CMakeFiles/extract_features.dir
+/content/drive/MyDrive/parallel_programming/test_v1/build/parallel_programming/build/CMakeFiles/edit_cache.dir
+/content/drive/MyDrive/parallel_programming/test_v1/build/parallel_programming/build/CMakeFiles/rebuild_cache.dir
