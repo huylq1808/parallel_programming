@@ -6,6 +6,8 @@ public:
     int kernel_size;    
     int stride;
     Tensor indices_cache; // Quan trọng: Lưu vị trí max
+    Tensor out_cache;
+    std::vector<int64_t> input_shape_cache;
 
     MaxPool2D(int k, int s);
     Tensor forward(const Tensor& input) override;

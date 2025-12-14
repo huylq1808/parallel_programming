@@ -1,196 +1,209 @@
 cmake_minimum_required(VERSION 3.18)
-project(DeepLearningCPP)
+project(DeepLearningCPP LANGUAGES CXX CUDA)
 
+# ==============================================================================
+# 1. GLOBAL CONFIGURATION
+# ==============================================================================
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CUDA_ARCHITECTURES native)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_ARCHITECTURES native) # Tối ưu cho GPU hiện tại
 
-# --- THÊM ĐOẠN NÀY ĐỂ TĂNG TỐC ---
+# Tăng tốc CPU build
 if(NOT MSVC)
     add_compile_options(-O3 -march=native -ffast-math -funroll-loops)
 endif()
 
-# --- 1. CUDA DETECTION ---
-include(CheckLanguage)
-check_language(CUDA)
-
-if(CMAKE_CUDA_COMPILER)
-    enable_language(CUDA)
-    find_package(CUDAToolkit REQUIRED)
-    add_compile_definitions(USE_CUDA)
-    message(STATUS ">> CUDA FOUND: GPU Acceleration Enabled")
-else()
-    message(STATUS ">> CUDA NOT FOUND: Compiling for CPU only")
-endif()
-
-# --- 2. INCLUDES ---
+# (Public Interface)
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
-# --- 3. SOURCES ---
-# Core Sources (Dùng chung cho cả App và Test)
-set(CORE_SRC 
-    src/core/Config.cpp
-    src/core/Allocator.cpp 
-    src/core/Storage.cpp 
-    src/core/Tensor.cpp
+# ==============================================================================
+# 2. SOURCE COLLECTION 
+# ==============================================================================
+# Gom toàn bộ source của CPU Backend
+file(GLOB_RECURSE SRC_CPU
+    "${CMAKE_SOURCE_DIR}/src/CPU/*.cpp"
+    "${CMAKE_SOURCE_DIR}/src/CPU/*.h"
 )
 
-# CPU Ops (Dùng chung)
-set(BACKEND_CPU_SRC src/backend/cpu/ops_cpu.cpp)
-
-# Layers (Cho App chính)
-set(LAYER_SRC 
-    # src/layers/Dense.cpp 
-    src/layers/Conv2D.cpp
-    src/layers/ReLU.cpp   
-    src/layers/Sigmoid.cpp
-    src/layers/MaxPool2D.cpp   
-    src/layers/Upsample.cpp
+# Gom toàn bộ source của GPU Naive Backend
+file(GLOB_RECURSE SRC_GPU_NAIVE
+    "${CMAKE_SOURCE_DIR}/src/GPU_naive/*.cu"
+    "${CMAKE_SOURCE_DIR}/src/GPU_naive/*.cuh"
+    "${CMAKE_SOURCE_DIR}/src/GPU_naive/*.cpp"
 )
 
-# loss function 
-set(LOSS_SRC src/loss/MSELoss.cpp)
+# Use all GPU_naive sources as a base
+set(SRC_GPU_OPT1 ${SRC_GPU_NAIVE})
 
-# optimizer
-set(OPTIM_SRC src/optim/SGD.cpp)
+# Remove the naive Tensor + Conv2D implementations
+list(REMOVE_ITEM SRC_GPU_OPT1
 
-# GPU Ops (Nếu có)
+    "${CMAKE_SOURCE_DIR}/src/GPU_naive/layers/Conv2D.cu"
+    "${CMAKE_SOURCE_DIR}/src/GPU_naive/core/Allocator.cpp"
+)
+
+# Add the optimized v1 versions instead
+list(APPEND SRC_GPU_OPT1
+
+    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v1/layers/Conv2D.cu"
+    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v1/core/Allocator.cpp"
+)
+
+# Use all GPU_opt_v1 sources as a base
+set(SRC_GPU_OPT_CUBLAS ${SRC_GPU_NAIVE})
+
+list(REMOVE_ITEM SRC_GPU_OPT_CUBLAS
+
+    "${CMAKE_SOURCE_DIR}/src/GPU_naive/layers/Conv2D.cu"
+    "${CMAKE_SOURCE_DIR}/src/GPU_naive/core/Allocator.cpp"
+)
+
+# Add the optimized v1 versions instead
+list(APPEND SRC_GPU_OPT_CUBLAS
+
+    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v1_cublas/layers/Conv2D.cu"
+    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v1_cublas/core/Allocator.cpp"
+)
+
+# ----------------------------------------------------------------------------
+
+# optimize v2
+file(GLOB_RECURSE SRC_GPU_OPT2
+    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v2/*.cu"
+    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v2/*.cuh"
+    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v2/*.cpp"
+)
+
+# ==============================================================================
+# 3. DEFINE LIBRARIES 
+# ==============================================================================
+
+# --- A. Library: CPU Version ---
+add_library(dl_cpu STATIC ${SRC_CPU})
+target_compile_definitions(dl_cpu PUBLIC USE_CPU_BACKEND)
+
+# --- B. Library: GPU Naive Version ---
 if(CMAKE_CUDA_COMPILER)
-    set(BACKEND_GPU_SRC 
-        src/backend/cuda/ops_bridge.cu
-        src/backend/cuda/kernels/naive/ElementWise.cu
-        src/backend/cuda/kernels/naive/Conv2D.cu
-        src/backend/cuda/kernels/naive/Activation.cu
-        src/backend/cuda/kernels/naive/Pooling.cu
-        src/backend/cuda/kernels/naive/Upsample.cu
-        src/backend/cuda/kernels/naive/Loss_Optimizer.cu
+    add_library(dl_gpu_naive STATIC ${SRC_GPU_NAIVE})
+    find_package(CUDAToolkit REQUIRED)
+
+    # Link với thư viện CUDA runtime
+    target_link_libraries(dl_gpu_naive PUBLIC CUDA::cudart CUDA::cublas)
+
+    target_compile_definitions(dl_gpu_naive PUBLIC
+        USE_GPU_NAIVE_BACKEND
+        USE_CUDA
     )
+
+    message(STATUS ">> ENABLED: GPU Naive Backend")
+else()
+    message(WARNING ">> CUDA NOT FOUND: GPU Backends will be disabled")
 endif()
 
-# =========================================================
-# --- 4. EXECUTABLES (APP CHÍNH) ---
-# =========================================================
-add_executable(benchmark 
-    tests/benchmark.cpp
-    ${CORE_SRC} 
-    ${BACKEND_CPU_SRC} 
-    ${LAYER_SRC} 
-    ${BACKEND_GPU_SRC}
-)
-
-# Link thư viện cho benchmark
 if(CMAKE_CUDA_COMPILER)
-    target_link_libraries(benchmark PRIVATE CUDA::cudart)
-endif()
+    add_library(dl_gpu_opt1 STATIC ${SRC_GPU_OPT1})
+    find_package(CUDAToolkit REQUIRED)
 
-# --- APP 1: CPU TRAINER ---
-add_executable(train_cpu
-    apps/train_cpu.cpp  # <--- File mới
-    ${CORE_SRC} ${BACKEND_CPU_SRC} ${LAYER_SRC} 
-    ${LOSS_SRC} ${OPTIM_SRC}
-    ${BACKEND_GPU_SRC} # Vẫn link vào để tránh lỗi linker nếu Ops.h có tham chiếu chéo, nhưng runtime không dùng
-)
-if(CMAKE_CUDA_COMPILER)
-    target_link_libraries(train_cpu PRIVATE CUDA::cudart)
-endif()
+    # Link với thư viện CUDA runtime
+    target_link_libraries(dl_gpu_opt1 PUBLIC CUDA::cudart CUDA::cublas)
 
-# --- APP 2: GPU TRAINER ---
-if(CMAKE_CUDA_COMPILER)
-    add_executable(train_gpu
-        apps/train_gpu.cpp  # <--- File mới
-        ${CORE_SRC} ${BACKEND_CPU_SRC} ${LAYER_SRC} 
-        ${LOSS_SRC} ${OPTIM_SRC}
-        ${BACKEND_GPU_SRC}
+    target_compile_definitions(dl_gpu_opt1 PUBLIC
+        USE_GPU_OPT1_BACKEND
+        USE_CUDA
     )
-    target_link_libraries(train_gpu PRIVATE CUDA::cudart)
+
+    message(STATUS ">> ENABLED: GPU Optimized V1 Backend")
+else()
+    message(WARNING ">> CUDA NOT FOUND: GPU Backends will be disabled")
 endif()
 
-# 2. Inference App
-add_executable(infer_net 
-    apps/inference.cpp
-    ${CORE_SRC} ${BACKEND_CPU_SRC} ${LAYER_SRC} 
-    ${BACKEND_GPU_SRC}
-)
 if(CMAKE_CUDA_COMPILER)
-    target_link_libraries(infer_net PRIVATE CUDA::cudart)
+    add_library(dl_gpu_opt1_cublas STATIC ${SRC_GPU_OPT_CUBLAS})
+    find_package(CUDAToolkit REQUIRED)
+
+    # Link với thư viện CUDA runtime
+    target_link_libraries(dl_gpu_opt1_cublas PUBLIC CUDA::cudart CUDA::cublas)
+    target_compile_definitions(dl_gpu_opt1_cublas PUBLIC
+        USE_GPU_OPT1_CUBLAS_BACKEND
+        USE_CUDA
+    )
+
+    message(STATUS ">> ENABLED: GPU Optimized V1 Backend")
+else()
+    message(WARNING ">> CUDA NOT FOUND: GPU Backends will be disabled")
 endif()
 
-# 3. Visualization Export App
-add_executable(visualize_export
-    apps/visualize_export.cpp
-    ${CORE_SRC} ${BACKEND_CPU_SRC} ${LAYER_SRC} 
-    ${BACKEND_GPU_SRC}
-)
+# --- C. Library: GPU Optimized V2 ---
 if(CMAKE_CUDA_COMPILER)
-    target_link_libraries(visualize_export PRIVATE CUDA::cudart)
+    add_library(dl_gpu_opt2 STATIC ${SRC_GPU_OPT2})
+    find_package(CUDAToolkit REQUIRED)
+
+    # Link với thư viện CUDA runtime
+    target_link_libraries(dl_gpu_opt2 PUBLIC CUDA::cudart CUDA::cublas)
+
+    target_compile_definitions(dl_gpu_opt2 PUBLIC
+        USE_GPU_OPT2_BACKEND
+        USE_CUDA
+    )
+
+    message(STATUS ">> ENABLED: GPU Optimized V2 Backend")
 endif()
 
-# =========================================================
-# --- 5. TESTS (KHU VỰC THÊM FILE TEST) ---
-# =========================================================
-
-# [TEST 1] Tensor CPU Test
-# Đây là executable mới, chỉ test Tensor và CPU Ops
-add_executable(tensor_cpu_test
-    tests/Tensor_cpu_test.cpp
-    ${CORE_SRC}
-    ${BACKEND_CPU_SRC}
-    ${BACKEND_GPU_SRC}   # <--- THÊM DÒNG NÀY (Chứa ops_bridge.cu)
-)
-
-# Link thư viện CUDA
-if(CMAKE_CUDA_COMPILER)
-    target_link_libraries(tensor_cpu_test PRIVATE CUDA::cudart)
+if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/visualize.cpp")
+    add_executable(visualize apps/visualize.cpp)
+    target_link_libraries(visualize PRIVATE dl_gpu_opt1) 
+    message(STATUS "   + Added Target: visualize")
 endif()
 
-# [TEST 2] Layer CPU Test
-# =========================================================
-add_executable(layer_cpu_test
-    tests/layer_cpu_test.cpp  # File test chính
-    ${CORE_SRC}
-    ${BACKEND_CPU_SRC}
-    ${LAYER_SRC}
-    ${BACKEND_GPU_SRC}
-)
+# ==============================================================================
+# 4. EXECUTABLES & TESTS
+# ==============================================================================
 
-# Nếu có CUDA thì link thêm thư viện (dù test CPU nhưng project là hybrid)
-if(CMAKE_CUDA_COMPILER)
-    target_link_libraries(layer_cpu_test PRIVATE CUDA::cudart)
+# Hàm tiện ích để tạo executable cho nhiều backend cùng lúc
+message(STATUS "Configuring Apps...")
+
+# --- APP 1: TRAIN CPU (train_net_cpu) ---
+if(EXISTS "${CMAKE_SOURCE_DIR}/apps/train_cpu.cpp")
+    add_executable(train_net_cpu apps/train_cpu.cpp)
+    target_link_libraries(train_net_cpu PRIVATE dl_cpu)
+    message(STATUS "   + Added Target: train_net_cpu")
 endif()
 
-# [TEST 3] Loss & Optimizer
-add_executable(loss_optim_test
-    tests/loss_optim_test.cpp
-    ${CORE_SRC}
-    ${BACKEND_CPU_SRC}
-    ${BACKEND_GPU_SRC}
-    ${LOSS_SRC}
-    ${OPTIM_SRC}
-)
-if(CMAKE_CUDA_COMPILER)
-    target_link_libraries(loss_optim_test PRIVATE CUDA::cudart)
+# --- APP 2: TRAIN GPU (train_net_gpu) ---
+if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/train_gpu_naive.cpp")
+    add_executable(train_net_gpu_naive apps/train_gpu_naive.cpp)
+    target_link_libraries(train_net_gpu_naive PRIVATE dl_gpu_naive)
+    message(STATUS "   + Added Target: train_net_gpu_naive")
 endif()
 
-# [TEST 4] DataLoader
-add_executable(dataloader_test
-    tests/dataloader_test.cpp
-    ${CORE_SRC}
-    ${BACKEND_CPU_SRC}
-    ${BACKEND_GPU_SRC}
-)
-if(CMAKE_CUDA_COMPILER)
-    target_link_libraries(dataloader_test PRIVATE CUDA::cudart)
+if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/train_gpu_opt_v1.cpp")
+    add_executable(train_net_gpu_opt1 apps/train_gpu_opt_v1.cpp)
+    target_link_libraries(train_net_gpu_opt1 PRIVATE dl_gpu_opt1)
+    message(STATUS "   + Added Target: train_net_gpu_opt1")
 endif()
 
-# [HƯỚNG DẪN THÊM TEST MỚI]
-# Nếu sau này bạn muốn thêm file test mới, ví dụ: tests/Layer_test.cpp
-# Hãy copy đoạn block dưới đây và đổi tên:
-#
-# add_executable(layer_test
-#     tests/Layer_test.cpp
-#     ${CORE_SRC}
-#     ${BACKEND_CPU_SRC}
-#     ${LAYER_SRC}          <-- Nếu test Layer thì cần thêm biến này
-# )
-# if(CMAKE_CUDA_COMPILER)
-#     target_link_libraries(layer_test PRIVATE CUDA::cudart)
+if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/train_gpu_opt_v1.cpp")
+    add_executable(train_net_gpu_opt1_cublas apps/train_gpu_opt_v1.cpp)
+    target_link_libraries(train_net_gpu_opt1_cublas PRIVATE dl_gpu_opt1_cublas)
+    message(STATUS "   + Added Target: train_net_gpu_opt1_cublas")
+endif()
+
+# --- APP 3: TRAIN GPU Optimized V2 (train_net_gpu_opt2) ---
+if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/train_gpu_opt_v2.cpp")
+    add_executable(train_net_gpu_opt2 apps/train_gpu_opt_v2.cpp)
+    target_link_libraries(train_net_gpu_opt2 PRIVATE dl_gpu_opt2)
+    message(STATUS "   + Added Target: train_net_gpu_opt2")
+endif()
+
+# --- APP: Feature Extraction ---
+# if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/extract_features.cpp")
+#     add_executable(extract_features apps/extract_features.cpp)
+#     target_link_libraries(extract_features PRIVATE dl_gpu_opt1)
+#     message(STATUS "   + Added Target: extract_features")
 # endif()
+
+if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/extract_features.cpp")
+    add_executable(extract_features apps/extract_features.cpp)
+    target_link_libraries(extract_features PRIVATE dl_gpu_opt1_cublas)
+    message(STATUS "   + Added Target: extract_features")
+endif()
