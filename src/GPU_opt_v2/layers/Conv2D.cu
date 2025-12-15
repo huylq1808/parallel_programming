@@ -168,6 +168,8 @@ Tensor Conv2D::forward(const Tensor& input) {
             (float*)col.data_ptr(),
             (float*)output.data_ptr() + n * out_c * col_w,
             out_c, col_w, col_h,
+            col_h, col_w, col_w,
+            false, false,
             false
         );
 
