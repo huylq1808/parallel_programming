@@ -3,231 +3,244 @@
 #include "core/Tensor.h"
 #include <cuda_runtime.h>
 
-namespace {
+#define CUDA_KERNEL_LOOP(i, n) \
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < (n); i += blockDim.x * gridDim.x)
 
-// --- FORWARD (Keep your optimized version) ---
-__global__ void k_conv2d_fwd_opt(
-    const float* __restrict__ in, 
-    const float* __restrict__ k, 
-    const float* __restrict__ b, 
-    float* __restrict__ out,
-    int C_in, int H_in, int W_in, 
-    int C_out, int H_out, int W_out, 
-    int K_size, int stride, int padding) 
-{
-    int n = blockIdx.z; 
+// ================================================================
+// im2col / col2im kernels
+// ================================================================
+
+__global__ void im2col_kernel(
+    const float* input, float* col,
+    int C, int H, int W,
+    int K, int stride, int pad,
+    int H_out, int W_out
+) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int vol_one_img = C_out * H_out * W_out;
+    int total = C * K * K * H_out * W_out;
+    if (idx >= total) return;
 
-    if (idx >= vol_one_img) return;
+    int w_out = idx % W_out;
+    int h_out = (idx / W_out) % H_out;
+    int k_w = (idx / (W_out * H_out)) % K;
+    int k_h = (idx / (W_out * H_out * K)) % K;
+    int c = idx / (W_out * H_out * K * K);
 
-    int ow = idx % W_out;
-    int tmp = idx / W_out;
-    int oh = tmp % H_out;
-    int oc = tmp / H_out; 
+    int h_in = h_out * stride - pad + k_h;
+    int w_in = w_out * stride - pad + k_w;
 
-    int in_offset_batch = n * (C_in * H_in * W_in);
-    int out_global_idx = n * vol_one_img + idx;
+    int col_row = c * K * K + k_h * K + k_w;
+    int col_col = h_out * W_out + w_out;
 
-    float sum = b[oc]; 
-    const float* in_img = in + in_offset_batch;
+    if (h_in >= 0 && h_in < H && w_in >= 0 && w_in < W)
+        col[col_row * (H_out * W_out) + col_col] =
+            input[(c * H + h_in) * W + w_in];
+    else
+        col[col_row * (H_out * W_out) + col_col] = 0.0f;
+}
 
-    for (int ic = 0; ic < C_in; ++ic) {
-        int in_offset_c = ic * H_in * W_in;
-        int k_offset_c  = oc * (C_in * K_size * K_size) + ic * (K_size * K_size);
+__global__ void col2im_kernel(
+    const float* col, float* grad_input,
+    int C, int H, int W,
+    int K, int stride, int pad,
+    int H_out, int W_out
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = C * H * W;
+    if (idx >= total) return;
 
-        #pragma unroll
-        for (int kh = 0; kh < K_size; ++kh) {
-            #pragma unroll
-            for (int kw = 0; kw < K_size; ++kw) {
-                int h_in = oh * stride - padding + kh;
-                int w_in = ow * stride - padding + kw;
-                
-                if (h_in >= 0 && h_in < H_in && w_in >= 0 && w_in < W_in) {
-                    sum += in_img[in_offset_c + h_in * W_in + w_in] * k[k_offset_c + kh * K_size + kw];
+    int w = idx % W;
+    int h = (idx / W) % H;
+    int c = idx / (H * W);
+
+    float val = 0.0f;
+
+    for (int kh = 0; kh < K; ++kh)
+        for (int kw = 0; kw < K; ++kw) {
+            int h_out = (h + pad - kh);
+            int w_out = (w + pad - kw);
+            if (h_out % stride == 0 && w_out % stride == 0) {
+                h_out /= stride;
+                w_out /= stride;
+                if (h_out >= 0 && h_out < H_out && w_out >= 0 && w_out < W_out) {
+                    int col_row = c * K * K + kh * K + kw;
+                    int col_col = h_out * W_out + w_out;
+                    val += col[col_row * (H_out * W_out) + col_col];
                 }
             }
         }
-    }
-    out[out_global_idx] = sum;
+
+    grad_input[idx] += val;
 }
 
-// --- NEW: OPTIMIZED BIAS GRADIENT (REDUCTION) ---
-// Eliminates atomic contention on bias
-__global__ void k_conv2d_bwd_bias(
-    const float* __restrict__ grad_out, 
-    float* __restrict__ grad_b, 
-    int N, int C_out, int H_out, int W_out) 
-{
-    // Each block handles 1 Output Channel
-    int oc = blockIdx.x; 
-    if (oc >= C_out) return;
+// ================================================================
+// Naive GEMM kernel: C = A * B
+// A: [M x K], B: [K x N], C: [M x N]
+// ================================================================
 
-    int vol_channel = H_out * W_out;
-    int total_elements = N * vol_channel; 
+__global__ void gemm_naive(
+    const float* A, const float* B, float* C,
+    int M, int N, int K,
+    bool accumulate
+) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M || col >= N) return;
 
-    float local_sum = 0.0f;
+    float sum = accumulate ? C[row * N + col] : 0.0f;
+    for (int k = 0; k < K; ++k)
+        sum += A[row * K + k] * B[k * N + col];
 
-    // Grid-Stride Loop: Sum across Batch and Spatial dimensions
-    for (int i = threadIdx.x; i < total_elements; i += blockDim.x) {
-        int n = i / vol_channel;
-        int rem = i % vol_channel;
-        int idx = n * (C_out * vol_channel) + oc * vol_channel + rem;
-        local_sum += grad_out[idx];
-    }
-
-    // Warp Shuffle Reduction (Very Fast)
-    for (int offset = warpSize / 2; offset > 0; offset /= 2) {
-        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
-    }
-
-    // Block Reduction (via Shared Memory or Atomics per warp)
-    // Here we use simple atomic per warp (reduces contention by 32x)
-    if (threadIdx.x % 32 == 0) {
-        atomicAdd(&grad_b[oc], local_sum);
-    }
+    C[row * N + col] = sum;
 }
 
-// --- OPTIMIZED BACKWARD (WEIGHTS & INPUT) ---
-// Removed Bias calculation to separate kernel
-__global__ void k_conv2d_bwd_data_weights(
-    const float* __restrict__ in, 
-    const float* __restrict__ k, 
-    const float* __restrict__ grad_out,
-    float* __restrict__ grad_in, 
-    float* __restrict__ grad_k, 
-    int C_in, int H_in, int W_in, 
-    int C_out, int H_out, int W_out, 
-    int K_size, int stride, int padding) 
-{
-    int n = blockIdx.z; 
+// ================================================================
+// Bias kernels
+// ================================================================
+
+__global__ void k_add_bias(float* out, const float* bias,
+                           int Cout, int spatial) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int vol_one_img = C_out * H_out * W_out;
-
-    if (idx >= vol_one_img) return;
-
-    int ow = idx % W_out;
-    int tmp = idx / W_out;
-    int oh = tmp % H_out;
-    int oc = tmp / H_out; 
-
-    int in_offset_batch = n * (C_in * H_in * W_in);
-    int go_global_idx = n * vol_one_img + idx;
-
-    float go_val = grad_out[go_global_idx];
-    
-    // Optimization: Skip if gradient is 0
-    if (abs(go_val) < 1e-9) return; 
-
-    const float* in_img = in + in_offset_batch;
-    float* gi_img = grad_in + in_offset_batch;
-
-    for (int ic = 0; ic < C_in; ++ic) {
-        int in_offset_c = ic * H_in * W_in;
-        int k_offset_c  = oc * (C_in * K_size * K_size) + ic * (K_size * K_size);
-
-        #pragma unroll
-        for (int kh = 0; kh < K_size; ++kh) {
-            #pragma unroll
-            for (int kw = 0; kw < K_size; ++kw) {
-                int h_in = oh * stride - padding + kh;
-                int w_in = ow * stride - padding + kw;
-                
-                if (h_in >= 0 && h_in < H_in && w_in >= 0 && w_in < W_in) {
-                    int in_idx = in_offset_c + h_in * W_in + w_in;
-                    int k_idx  = k_offset_c + kh * K_size + kw;
-                    
-                    // Still need atomic here for Weights and Input
-                    // But removed atomic on Bias
-                    atomicAdd(&grad_k[k_idx], in_img[in_idx] * go_val);
-                    atomicAdd(&gi_img[in_idx], k[k_idx] * go_val);
-                }
-            }
-        }
-    }
+    if (idx >= Cout * spatial) return;
+    int oc = idx / spatial;
+    out[idx] += bias[oc];
 }
-} // namespace
 
-// ======================================================================
-// IMPLEMENTATION
-// ======================================================================
+__global__ void k_bias_grad(const float* grad_out, float* grad_b,
+                            int Cout, int spatial) {
+    int oc = blockIdx.x * blockDim.x + threadIdx.x;
+    if (oc >= Cout) return;
+    float sum = 0.0f;
+    for (int i = 0; i < spatial; ++i)
+        sum += grad_out[oc * spatial + i];
+    atomicAdd(&grad_b[oc], sum);
+}
 
-Conv2D::Conv2D(int in, int out, int k, int s, int p) 
-    : in_c(in), out_c(out), k_size(k), stride(s), padding(p) 
-{
-    W = Tensor::randn({out, in, k, k}, 0.0f, 0.08f, DeviceType::CUDA);
-    b = Tensor::zeros({out}, DeviceType::CUDA);
-    W.requires_grad = true; b.requires_grad = true;
+// ================================================================
+// Conv2D implementation
+// ================================================================
+
+Conv2D::Conv2D(int in, int out, int k, int s, int p)
+    : in_c(in), out_c(out), k_size(k), stride(s), padding(p) {
+
+    W = Tensor::randn({out, in, k, k}, 0.0f, 0.08f).to(DeviceType::CUDA);
+    b = Tensor::zeros({out}).to(DeviceType::CUDA);
+    W.requires_grad = true;
+    b.requires_grad = true;
 }
 
 Tensor Conv2D::forward(const Tensor& input) {
     input_cache = input.to(DeviceType::CUDA);
+
     int N = input_cache.sizes[0];
-    int H = input_cache.sizes[2]; 
+    int C = input_cache.sizes[1];
+    int H = input_cache.sizes[2];
     int W_in = input_cache.sizes[3];
-    int H_out = (H + 2*padding - k_size) / stride + 1;
-    int W_out = (W_in + 2*padding - k_size) / stride + 1;
 
-    Tensor out = Tensor::empty({N, out_c, H_out, W_out}, DeviceType::CUDA);
+    int H_out = (H + 2 * padding - k_size) / stride + 1;
+    int W_out = (W_in + 2 * padding - k_size) / stride + 1;
 
-    int vol_one_img = out_c * H_out * W_out;
-    int threads = 256;
-    int blocks_x = (vol_one_img + threads - 1) / threads;
-    dim3 grid(blocks_x, 1, N); 
-    dim3 block(threads, 1, 1);
+    Tensor output = Tensor::zeros({N, out_c, H_out, W_out}, DeviceType::CUDA);
 
-    k_conv2d_fwd_opt<<<grid, block>>>(
-        (const float*)input_cache.data_ptr(), (const float*)W.data_ptr(), (const float*)b.data_ptr(), (float*)out.data_ptr(),
-        in_c, H, W_in, out_c, H_out, W_out, k_size, stride, padding
-    );
+    int col_h = C * k_size * k_size;
+    int col_w = H_out * W_out;
+
+    Tensor col = Tensor::empty({col_h, col_w}, DeviceType::CUDA);
+
+    dim3 block(16, 16);
+    dim3 grid((col_w + 15) / 16, (out_c + 15) / 16);
+
+    for (int n = 0; n < N; ++n) {
+        im2col_kernel<<<(col_h * col_w + 255) / 256, 256>>>(
+            (float*)input_cache.data_ptr() + n * C * H * W_in,
+            (float*)col.data_ptr(),
+            C, H, W_in, k_size, stride, padding, H_out, W_out
+        );
+
+        gemm_naive<<<grid, block>>>(
+            (float*)W.data_ptr(),
+            (float*)col.data_ptr(),
+            (float*)output.data_ptr() + n * out_c * col_w,
+            out_c, col_w, col_h,
+            false
+        );
+
+        k_add_bias<<<(out_c * col_w + 255) / 256, 256>>>(
+            (float*)output.data_ptr() + n * out_c * col_w,
+            (float*)b.data_ptr(),
+            out_c, col_w
+        );
+    }
+
     CHECK(cudaGetLastError());
-    return out;
+    return output;
 }
 
 Tensor Conv2D::backward(const Tensor& grad_output) {
-    Tensor grad_out_gpu = grad_output.to(DeviceType::CUDA);
-    if(!W.grad) W.ensure_grad();
-    if(!b.grad) b.ensure_grad();
-    
-    Tensor dIn = Tensor::zeros(input_cache.sizes, DeviceType::CUDA);
-    W.zero_grad();
-    b.zero_grad();
+    Tensor grad_out = grad_output.to(DeviceType::CUDA);
 
     int N = input_cache.sizes[0];
+    int C = input_cache.sizes[1];
     int H = input_cache.sizes[2];
     int W_in = input_cache.sizes[3];
-    int H_out = grad_out_gpu.sizes[2];
-    int W_out = grad_out_gpu.sizes[3];
+    int H_out = grad_out.sizes[2];
+    int W_out = grad_out.sizes[3];
 
-    // 1. Calculate Bias Gradient (Separate optimized kernel)
-    // Grid = Number of Output Channels
-    int threads_bias = 256;
-    k_conv2d_bwd_bias<<<out_c, threads_bias>>>(
-        (const float*)grad_out_gpu.data_ptr(),
-        (float*)b.grad->data_ptr(),
-        N, out_c, H_out, W_out
-    );
+    int col_h = C * k_size * k_size;
+    int col_w = H_out * W_out;
 
-    // 2. Calculate Weights & Input Gradient
-    int vol_one_img = out_c * H_out * W_out;
-    int threads = 256;
-    int blocks_x = (vol_one_img + threads - 1) / threads;
-    dim3 grid(blocks_x, 1, N); 
-    dim3 block(threads, 1, 1);
+    Tensor grad_input = Tensor::zeros(input_cache.sizes, DeviceType::CUDA);
+    W.ensure_grad(); W.zero_grad();
+    b.ensure_grad(); b.zero_grad();
 
-    k_conv2d_bwd_data_weights<<<grid, block>>>(
-        (const float*)input_cache.data_ptr(), 
-        (const float*)W.data_ptr(), 
-        (const float*)grad_out_gpu.data_ptr(),
-        (float*)dIn.data_ptr(), 
-        (float*)W.grad->data_ptr(), 
-        in_c, H, W_in, out_c, H_out, W_out, k_size, stride, padding
-    );
+    Tensor col = Tensor::empty({col_h, col_w}, DeviceType::CUDA);
+    Tensor grad_col = Tensor::zeros({col_h, col_w}, DeviceType::CUDA);
+
+    dim3 block(16, 16);
+
+    for (int n = 0; n < N; ++n) {
+        im2col_kernel<<<(col_h * col_w + 255) / 256, 256>>>(
+            (float*)input_cache.data_ptr() + n * C * H * W_in,
+            (float*)col.data_ptr(),
+            C, H, W_in, k_size, stride, padding, H_out, W_out
+        );
+
+        dim3 grid_w((out_c + 15) / 16, (col_h + 15) / 16);
+        gemm_naive<<<grid_w, block>>>(
+            (float*)grad_out.data_ptr() + n * out_c * col_w,
+            (float*)col.data_ptr(),
+            (float*)W.grad->data_ptr(),
+            out_c, col_h, col_w,
+            true
+        );
+
+        dim3 grid_col((col_w + 15) / 16, (col_h + 15) / 16);
+        gemm_naive<<<grid_col, block>>>(
+            (float*)W.data_ptr(),
+            (float*)grad_out.data_ptr() + n * out_c * col_w,
+            (float*)grad_col.data_ptr(),
+            col_h, col_w, out_c,
+            false
+        );
+
+        col2im_kernel<<<(C * H * W_in + 255) / 256, 256>>>(
+            (float*)grad_col.data_ptr(),
+            (float*)grad_input.data_ptr() + n * C * H * W_in,
+            C, H, W_in, k_size, stride, padding, H_out, W_out
+        );
+
+        k_bias_grad<<<(out_c + 255) / 256, 256>>>(
+            (float*)grad_out.data_ptr() + n * out_c * col_w,
+            (float*)b.grad->data_ptr(),
+            out_c, col_w
+        );
+    }
+
     CHECK(cudaGetLastError());
-    return dIn;
+    return grad_input;
 }
 
-void Conv2D::to(DeviceType device){
+void Conv2D::to(DeviceType device) {
     W = W.to(device);
     b = b.to(device);
 }
