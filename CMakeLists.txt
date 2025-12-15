@@ -68,6 +68,7 @@ list(APPEND SRC_GPU_OPT_CUBLAS
 
     "${CMAKE_SOURCE_DIR}/src/GPU_opt_v2_cublas/layers/Conv2D.cu"
     "${CMAKE_SOURCE_DIR}/src/GPU_opt_v2_cublas/core/Allocator.cpp"
+    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v2_cublas/kernels/im2col.cu"
 )
 
 
