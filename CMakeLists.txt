@@ -35,21 +35,26 @@ file(GLOB_RECURSE SRC_GPU_NAIVE
 # Use all GPU_naive sources as a base
 set(SRC_GPU_OPT1 ${SRC_GPU_NAIVE})
 
-# Remove the naive Tensor + Conv2D implementations
-list(REMOVE_ITEM SRC_GPU_OPT1
+file(GLOB_RECURSE SRC_GPU_OPT1
+    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v1/*.cu"
+    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v1/*.cuh"
+    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v1/*.cpp"
+)
+
+set(SRC_GPU_OPT2 ${SRC_GPU_NAIVE})
+
+list(REMOVE_ITEM SRC_GPU_OPT2
 
     "${CMAKE_SOURCE_DIR}/src/GPU_naive/layers/Conv2D.cu"
     "${CMAKE_SOURCE_DIR}/src/GPU_naive/core/Allocator.cpp"
 )
 
-# Add the optimized v1 versions instead
-list(APPEND SRC_GPU_OPT1
+list(APPEND SRC_GPU_OPT2
 
-    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v1/layers/Conv2D.cu"
-    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v1/core/Allocator.cpp"
+    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v2/layers/Conv2D.cu"
+    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v2/core/Allocator.cpp"
 )
 
-# Use all GPU_opt_v1 sources as a base
 set(SRC_GPU_OPT_CUBLAS ${SRC_GPU_NAIVE})
 
 list(REMOVE_ITEM SRC_GPU_OPT_CUBLAS
@@ -61,18 +66,11 @@ list(REMOVE_ITEM SRC_GPU_OPT_CUBLAS
 # Add the optimized v1 versions instead
 list(APPEND SRC_GPU_OPT_CUBLAS
 
-    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v1_cublas/layers/Conv2D.cu"
-    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v1_cublas/core/Allocator.cpp"
+    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v2_cublas/layers/Conv2D.cu"
+    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v2_cublas/core/Allocator.cpp"
 )
 
-# ----------------------------------------------------------------------------
 
-# optimize v2
-file(GLOB_RECURSE SRC_GPU_OPT2
-    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v2/*.cu"
-    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v2/*.cuh"
-    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v2/*.cpp"
-)
 
 # ==============================================================================
 # 3. DEFINE LIBRARIES 
@@ -118,17 +116,17 @@ else()
 endif()
 
 if(CMAKE_CUDA_COMPILER)
-    add_library(dl_gpu_opt1_cublas STATIC ${SRC_GPU_OPT_CUBLAS})
+    add_library(dl_gpu_opt2_cublas STATIC ${SRC_GPU_OPT_CUBLAS})
     find_package(CUDAToolkit REQUIRED)
 
     # Link với thư viện CUDA runtime
-    target_link_libraries(dl_gpu_opt1_cublas PUBLIC CUDA::cudart CUDA::cublas)
-    target_compile_definitions(dl_gpu_opt1_cublas PUBLIC
+    target_link_libraries(dl_gpu_opt2_cublas PUBLIC CUDA::cudart CUDA::cublas)
+    target_compile_definitions(dl_gpu_opt2_cublas PUBLIC
         USE_GPU_OPT1_CUBLAS_BACKEND
         USE_CUDA
     )
 
-    message(STATUS ">> ENABLED: GPU Optimized V1 Backend")
+    message(STATUS ">> ENABLED: GPU Optimized V2 Backend")
 else()
     message(WARNING ">> CUDA NOT FOUND: GPU Backends will be disabled")
 endif()
@@ -151,7 +149,7 @@ endif()
 
 if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/visualize.cpp")
     add_executable(visualize apps/visualize.cpp)
-    target_link_libraries(visualize PRIVATE dl_gpu_opt1) 
+    target_link_libraries(visualize PRIVATE dl_gpu_opt2) 
     message(STATUS "   + Added Target: visualize")
 endif()
 
@@ -176,23 +174,22 @@ if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/train_gpu_naive.cpp"
     message(STATUS "   + Added Target: train_net_gpu_naive")
 endif()
 
-if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/train_gpu_opt_v1.cpp")
-    add_executable(train_net_gpu_opt1 apps/train_gpu_opt_v1.cpp)
-    target_link_libraries(train_net_gpu_opt1 PRIVATE dl_gpu_opt1)
-    message(STATUS "   + Added Target: train_net_gpu_opt1")
-endif()
-
-if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/train_gpu_opt_v1.cpp")
-    add_executable(train_net_gpu_opt1_cublas apps/train_gpu_opt_v1.cpp)
-    target_link_libraries(train_net_gpu_opt1_cublas PRIVATE dl_gpu_opt1_cublas)
-    message(STATUS "   + Added Target: train_net_gpu_opt1_cublas")
-endif()
-
-# --- APP 3: TRAIN GPU Optimized V2 (train_net_gpu_opt2) ---
 if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/train_gpu_opt_v2.cpp")
     add_executable(train_net_gpu_opt2 apps/train_gpu_opt_v2.cpp)
     target_link_libraries(train_net_gpu_opt2 PRIVATE dl_gpu_opt2)
     message(STATUS "   + Added Target: train_net_gpu_opt2")
+endif()
+
+if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/train_gpu_opt_v2.cpp")
+    add_executable(train_net_gpu_opt2_cublas apps/train_gpu_opt_v2.cpp)
+    target_link_libraries(train_net_gpu_opt2_cublas PRIVATE dl_gpu_opt2_cublas)
+    message(STATUS "   + Added Target: train_net_gpu_opt2_cublas")
+endif()
+
+if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/train_gpu_opt_v1.cpp")
+    add_executable(train_net_gpu_opt1 apps/train_gpu_opt_v1.cpp)
+    target_link_libraries(train_net_gpu_opt1 PRIVATE dl_gpu_opt1)
+    message(STATUS "   + Added Target: train_net_gpu_opt1")
 endif()
 
 # --- APP: Feature Extraction ---
@@ -204,6 +201,6 @@ endif()
 
 if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/extract_features.cpp")
     add_executable(extract_features apps/extract_features.cpp)
-    target_link_libraries(extract_features PRIVATE dl_gpu_opt1_cublas)
+    target_link_libraries(extract_features PRIVATE dl_gpu_opt2_cublas)
     message(STATUS "   + Added Target: extract_features")
 endif()
