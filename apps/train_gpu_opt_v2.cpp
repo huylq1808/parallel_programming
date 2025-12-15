@@ -4,19 +4,20 @@
 #include <filesystem>
 
 #include "core/Tensor.h"
-#include "core/CheckError.h" // Để dùng CHECK macro nếu cần
+#include "core/CheckError.h" 
 #include "loss/MSELoss.h"
 #include "optim/SGD.h"
 #include "dataloader/CifarDataLoader.h"
 #include "utils/Serializer.h"
-#include "models/Autoencoder_v2.h"
+#include "models/Autoencoder.h"
+
 
 #ifndef USE_CUDA
 #error "This file requires CUDA to be enabled in CMake!"
 #endif
 
 // Hàm Validation GPU
-float validate(Autoencoder_v2& model, CifarDataLoader& loader, MSELoss& criterion) {
+float validate(Autoencoder& model, CifarDataLoader& loader, MSELoss& criterion) {
     loader.startEpoch(false);
     float total_loss = 0.0f;
     int steps = 0;
@@ -39,10 +40,10 @@ int main(int argc, char** argv) {
     // Config
     std::string data_path = "../data/cifar-10-batches-bin";
     int batch_size = 64;
-    int epochs = 10;
+    int epochs = 20;
     float lr = 0.001f;
-    int train_samples = 10000;
-    int val_samples = 1000;
+    int train_samples = 50000;
+    int val_samples = 10000;
 
     if (argc > 1) data_path = argv[1];
     if (argc > 2) batch_size = std::atoi(argv[2]);
@@ -58,7 +59,7 @@ int main(int argc, char** argv) {
     CifarDataLoader trainLoader(data_path, CifarDataLoader::Split::Train, batch_size, train_samples);
     CifarDataLoader valLoader(data_path, CifarDataLoader::Split::Test, batch_size, val_samples);
 
-    Autoencoder_v2 model;
+    Autoencoder model;
     // 1. Chuyển Model sang GPU ngay lập tức
     model.to(DeviceType::CUDA); 
 
@@ -99,7 +100,6 @@ int main(int argc, char** argv) {
         }
         
         float avg_val_loss = validate(model, valLoader, criterion);
-        cudaDeviceSynchronize();
         auto t_end = std::chrono::high_resolution_clock::now();
         
         std::cout << "\rEpoch [" << epoch+1 << "/" << epochs << "] "
