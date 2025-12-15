@@ -78,7 +78,7 @@ __global__ void col2im_kernel(
 // A: [M x K], B: [K x N], C: [M x N]
 // ================================================================
 
-__global__ void gemm_kernel(
+__global__ void gemm_naive(
     const float* A, const float* B, float* C,
     int M, int N, int K,
     int lda, int ldb, int ldc,
