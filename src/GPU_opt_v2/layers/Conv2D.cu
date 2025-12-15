@@ -78,20 +78,26 @@ __global__ void col2im_kernel(
 // A: [M x K], B: [K x N], C: [M x N]
 // ================================================================
 
-__global__ void gemm_naive(
+__global__ void gemm_kernel(
     const float* A, const float* B, float* C,
     int M, int N, int K,
+    int lda, int ldb, int ldc,
+    bool transA, bool transB,
     bool accumulate
 ) {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= M || col >= N) return;
 
-    float sum = accumulate ? C[row * N + col] : 0.0f;
-    for (int k = 0; k < K; ++k)
-        sum += A[row * K + k] * B[k * N + col];
-
-    C[row * N + col] = sum;
+    float sum = accumulate ? C[row * ldc + col] : 0.0f;
+    
+    for (int k = 0; k < K; ++k) {
+        float a_val = transA ? A[k * lda + row] : A[row * lda + k];
+        float b_val = transB ? B[col * ldb + k] : B[k * ldb + col];
+        sum += a_val * b_val;
+    }
+    
+    C[row * ldc + col] = sum;
 }
 
 // ================================================================
@@ -211,6 +217,8 @@ Tensor Conv2D::backward(const Tensor& grad_output) {
             (float*)col.data_ptr(),
             (float*)W.grad->data_ptr(),
             out_c, col_h, col_w,
+            col_w, col_w, col_h,
+            false, true,
             true
         );
 
@@ -220,6 +228,8 @@ Tensor Conv2D::backward(const Tensor& grad_output) {
             (float*)grad_out.data_ptr() + n * out_c * col_w,
             (float*)grad_col.data_ptr(),
             col_h, col_w, out_c,
+            col_h, col_w, col-w,
+            true, false,
             false
         );
 
