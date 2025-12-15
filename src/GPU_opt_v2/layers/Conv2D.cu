@@ -228,7 +228,7 @@ Tensor Conv2D::backward(const Tensor& grad_output) {
             (float*)grad_out.data_ptr() + n * out_c * col_w,
             (float*)grad_col.data_ptr(),
             col_h, col_w, out_c,
-            col_h, col_w, col-w,
+            col_h, col_w, col_w,
             true, false,
             false
         );
