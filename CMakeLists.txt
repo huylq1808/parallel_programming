@@ -71,7 +71,18 @@ list(APPEND SRC_GPU_OPT_CUBLAS
     "${CMAKE_SOURCE_DIR}/src/GPU_opt_v2_cublas/kernels/im2col.cu"
 )
 
+set(SRC_GPU_OPT3 ${SRC_GPU_NAIVE})
 
+list(REMOVE_ITEM SRC_GPU_OPT3
+
+    "${CMAKE_SOURCE_DIR}/src/GPU_naive/layers/Conv2D.cu"
+    "${CMAKE_SOURCE_DIR}/src/GPU_naive/core/Allocator.cpp"
+)
+
+list(APPEND SRC_GPU_OPT3
+    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v3/layers/Conv2D.cu"
+    "${CMAKE_SOURCE_DIR}/src/GPU_opt_v3/core/Allocator.cpp"
+)
 
 # ==============================================================================
 # 3. DEFINE LIBRARIES 
@@ -146,6 +157,21 @@ if(CMAKE_CUDA_COMPILER)
     )
 
     message(STATUS ">> ENABLED: GPU Optimized V2 Backend")
+endif()
+
+if(CMAKE_CUDA_COMPILER)
+    add_library(dl_gpu_opt3 STATIC ${SRC_GPU_OPT3})
+    find_package(CUDAToolkit REQUIRED)
+
+    # Link với thư viện CUDA runtime
+    target_link_libraries(dl_gpu_opt3 PUBLIC CUDA::cudart CUDA::cublas)
+
+    target_compile_definitions(dl_gpu_opt3 PUBLIC
+        USE_GPU_OPT3_BACKEND
+        USE_CUDA
+    )
+
+    message(STATUS ">> ENABLED: GPU Optimized V3 Backend")
 endif()
 
 if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/visualize.cpp")
