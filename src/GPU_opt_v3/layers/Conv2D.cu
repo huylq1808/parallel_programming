@@ -37,19 +37,21 @@ __global__ void im2col_kernel_batch(
 }
 
 // Kernel tối ưu cho col2im ( grid 3D)
-__global__ void col2im_kernel(
+__global__ void col2im_kernel_batch(
     const float* col, float* grad_input,
-    int C, int H, int W,
+    int N, int C, int H, int W,     
     int K, int stride, int pad,
     int H_out, int W_out
 ) {
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-    int w = blockIdx.x * blockDim.x + tx;
-    int h = blockIdx.y * blockDim.y + ty;
-    int c = blockIdx.z;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * C * H * W;
+    if (idx >= total) return;
 
-    if (h >= H || w >= W || c >= C) return;
+    // Decode: idx → (n, c, h, w)
+    int w = idx % W;
+    int h = (idx / W) % H;
+    int c = (idx / (W * H)) % C;
+    int n = idx / (W * H * C);
 
     float sum = 0.0f;
 
@@ -58,18 +60,22 @@ __global__ void col2im_kernel(
     int w_out_start = max(0, (w - K + 1 + pad) / stride);
     int w_out_end = min(W_out, (w + pad) / stride + 1);
 
+    // Offset for sample n in col buffer
+    int col_offset = n * (C * K * K * H_out * W_out);
+
     for (int h_out = h_out_start; h_out < h_out_end; ++h_out) {
         for (int w_out = w_out_start; w_out < w_out_end; ++w_out) {
             int kh = h + pad - h_out * stride;
             int kw = w + pad - w_out * stride;
             if (kh >= 0 && kh < K && kw >= 0 && kw < K) {
                 int k_idx = c * K * K + kh * K + kw;
-                sum += col[k_idx * (H_out * W_out) + h_out * W_out + w_out];
+                sum += col[col_offset + k_idx * (H_out * W_out) + h_out * W_out + w_out];
             }
         }
     }
 
-    grad_input[c * H * W + h * W + w] = sum;
+    // Write to sample n's grad_input
+    grad_input[n * (C * H * W) + c * (H * W) + h * W + w] = sum;
 }
 
 // Kernel bias_grad với batch (sum qua N)
@@ -255,11 +261,12 @@ Tensor Conv2D::backward(const Tensor& grad_output) {
     );
 
     // col2im: grid 3D cho parallelism
-    dim3 threads_dim(16, 16);
-    dim3 blocks_dim((W_in + 15)/16, (H + 15)/16, C);
-    col2im_kernel<<<blocks_dim, threads_dim>>>(
+    int total_input = N * C * H * W_in;
+    threads = 256;
+    blocks = (total_input + threads - 1) / threads;
+    col2im_kernel_batch<<<blocks, threads>>>(
         (float*)grad_col.data_ptr(), (float*)grad_input.data_ptr(),
-        C, H, W_in, k_size, stride, padding, H_out, W_out
+        N, C, H, W_in, k_size, stride, padding, H_out, W_out
     );
 
     // Bias grad batch
