@@ -219,8 +219,8 @@ if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/train_gpu_opt_v1.cpp
     message(STATUS "   + Added Target: train_net_gpu_opt1")
 endif()
 
-if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/train_gpu_opt_v1.cpp")
-    add_executable(train_net_gpu_opt3 apps/train_gpu_opt_v1.cpp)
+if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_SOURCE_DIR}/apps/train_gpu_opt_v2.cpp")
+    add_executable(train_net_gpu_opt3 apps/train_gpu_opt_v2.cpp)
     target_link_libraries(train_net_gpu_opt3 PRIVATE dl_gpu_opt3)
     message(STATUS "   + Added Target: train_net_gpu_opt3")
 endif()
