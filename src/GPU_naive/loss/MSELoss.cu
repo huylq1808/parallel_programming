@@ -23,10 +23,9 @@ __global__ void k_mse_bwd(const float* pred, const float* target, float* grad, i
 } // namespace
 
 float MSELoss::forward(const Tensor& input, const Tensor& target) {
-    // 1. [QUAN TRỌNG] Đảm bảo cả input và target đều ở trên GPU
-    // Input từ model ra thì đã là GPU, nhưng Target từ DataLoader vào thường là CPU.
-    input_cache = input; // (Giả sử input đã ở GPU, nếu chưa chắc thì .to(CUDA))
-    target_cache = target.to(DeviceType::CUDA); // <--- FIX LỖI 700 TẠI ĐÂY
+    // 1. Đảm bảo cả input và target đều ở trên GPU
+    input_cache = input; 
+    target_cache = target.to(DeviceType::CUDA); 
 
     int n = input_cache.numel();
     
@@ -41,7 +40,7 @@ float MSELoss::forward(const Tensor& input, const Tensor& target) {
     
     k_mse_loss<<<blocks, threads>>>(
         (const float*)input_cache.data_ptr(), 
-        (const float*)target_cache.data_ptr(), // Bây giờ đây là pointer GPU an toàn
+        (const float*)target_cache.data_ptr(), 
         d_sum, 
         n
     );
@@ -56,8 +55,7 @@ float MSELoss::forward(const Tensor& input, const Tensor& target) {
 }
 
 Tensor MSELoss::backward() {
-    // 5. [QUAN TRỌNG] Tạo Tensor gradient trên GPU
-    // Nếu không chỉ định DeviceType::CUDA, nó sẽ tạo trên CPU -> Crash khi đưa vào kernel
+    // 5. Tạo Tensor gradient trên GPU
     Tensor dInput = Tensor::zeros(input_cache.sizes, DeviceType::CUDA); 
 
     int n = input_cache.numel();

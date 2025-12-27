@@ -5,7 +5,7 @@
 
 namespace {
 
-// --- FORWARD (Fused) ---
+//FORWARD (Fused) 
 __global__ void k_conv2d_relu_fwd_opt(
     const float* __restrict__ in, 
     const float* __restrict__ k, 
@@ -53,7 +53,7 @@ __global__ void k_conv2d_relu_fwd_opt(
     out[out_global_idx] = (sum > 0.0f) ? sum : 0.0f;
 }
 
-// --- OPTIMIZED BIAS BACKWARD (With ReLU Check) ---
+//  OPTIMIZED BIAS BACKWARD
 __global__ void k_conv2d_relu_bwd_bias(
     const float* __restrict__ grad_out, 
     const float* __restrict__ fwd_out, // Needed for ReLU mask
@@ -73,7 +73,7 @@ __global__ void k_conv2d_relu_bwd_bias(
         int rem = i % vol_channel;
         int idx = n * (C_out * vol_channel) + oc * vol_channel + rem;
         
-        // FUSED RELU CHECK: Only accumulate if forward output > 0
+        // Only accumulate if forward output > 0
         if (fwd_out[idx] > 0.0f) {
             local_sum += grad_out[idx];
         }
@@ -89,7 +89,7 @@ __global__ void k_conv2d_relu_bwd_bias(
     }
 }
 
-// --- OPTIMIZED DATA/WEIGHT BACKWARD (With ReLU Check) ---
+//OPTIMIZED DATA/WEIGHT BACKWARD
 __global__ void k_conv2d_relu_bwd_data_weights(
     const float* __restrict__ in, 
     const float* __restrict__ k, 
@@ -151,9 +151,6 @@ __global__ void k_conv2d_relu_bwd_data_weights(
 }
 } // namespace
 
-// ======================================================================
-// IMPLEMENTATION 
-// ======================================================================
 
 Conv2D_relu::Conv2D_relu(int in, int out, int k, int s, int p) 
     : in_c(in), out_c(out), k_size(k), stride(s), padding(p) 

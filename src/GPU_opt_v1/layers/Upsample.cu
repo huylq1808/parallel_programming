@@ -4,23 +4,20 @@
 
 namespace {
 
-// --- VECTORIZED FORWARD (Mỗi thread ghi 4 pixels output) ---
+// VECTORIZED FORWARD 
 __global__ void k_upsample_fwd_vec4(const float* __restrict__ in, float* __restrict__ out, 
                                int C, int H_in, int W_in, int H_out, int W_out, int scale) 
 {
-    // idx này là index của gói float4
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     
-    // Tổng số gói vector trong 1 ảnh (giả sử W_out chia hết cho 4)
     int vol_vec_one_img = (C * H_out * W_out) / 4; 
 
     if (idx >= vol_vec_one_img) return;
 
-    // 1. Tính toán tọa độ Output cho phần tử đầu tiên trong gói 4
+    // 1. Tính toán tọa độ Output cho phần tử đầu tiên 
     int out_idx_0 = idx * 4; 
 
     // Giải mã tọa độ: ow, oh, c
-    // Lưu ý: Ta giả định W_out chia hết cho 4 để ow luôn align 4
     int ow = out_idx_0 % W_out;
     int tmp = out_idx_0 / W_out;
     int oh = tmp % H_out;
@@ -32,13 +29,12 @@ __global__ void k_upsample_fwd_vec4(const float* __restrict__ in, float* __restr
     // Con trỏ tới ảnh input tương ứng trong batch
     const float* in_ptr = in + n * (C * H_in * W_in);
     
-    // Con trỏ tới output (ép kiểu float4)
+    // ép kiểu float4
     float4* out_ptr = (float4*)out + (n * vol_vec_one_img);
 
-    // 2. Nearest Neighbor Mapping
+    // 2.Nearest Neighbor Mapping
     int in_h = oh / scale;
     
-    // Base offset của channel + row
     int base_in_offset = c * (H_in * W_in) + in_h * W_in;
 
     float4 res;

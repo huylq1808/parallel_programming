@@ -17,7 +17,6 @@ __global__ void k_maxpool_fwd_2out_vec4(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     
     // Số lượng cặp pixel cần xử lý trong 1 ảnh
-    // Vì mỗi thread làm 2 pixel nên số thread cần thiết = (C * H_out * W_out) / 2
     int vol_pair = (C * H_out * W_out) / 2; 
     
     // Batch index
@@ -25,19 +24,16 @@ __global__ void k_maxpool_fwd_2out_vec4(
 
     if (idx >= vol_pair) return;
 
-    // --- 1. GIẢI MÃ TỌA ĐỘ OUTPUT ---
-    // Output index thực tế (của pixel đầu tiên trong cặp)
+    // 1. GIẢI MÃ TỌA ĐỘ OUTPUT
     int out_idx_0 = idx * 2;
     
     // Map linear index về (c, oh, ow)
-    // Lưu ý: ow luôn là số chẵn (0, 2, 4...) do ta bước nhảy 2
     int ow = out_idx_0 % W_out;
     int tmp = out_idx_0 / W_out;
     int oh = tmp % H_out;
     int c = tmp / H_out;
 
-    // --- 2. XÁC ĐỊNH TỌA ĐỘ INPUT ---
-    // Output (oh, ow) tương ứng Input (2*oh, 2*ow)
+    // 2. XÁC ĐỊNH TỌA ĐỘ INPUT 
     int h_in = oh * 2;
     int w_in = ow * 2;
 
@@ -49,11 +45,11 @@ __global__ void k_maxpool_fwd_2out_vec4(
     const float4* row0_ptr = (const float4*)(in + img_offset + h_in * W_in + w_in);
     const float4* row1_ptr = (const float4*)(in + img_offset + (h_in + 1) * W_in + w_in);
 
-    // --- 3. LOAD DỮ LIỆU (CHỈ 2 LẦN ĐỌC) ---
+    // 3. LOAD DỮ LIỆU 
     float4 v0 = *row0_ptr; // Row0[0], Row0[1], Row0[2], Row0[3]
     float4 v1 = *row1_ptr; // Row1[0], Row1[1], Row1[2], Row1[3]
 
-    // --- 4. TÍNH TOÁN POOLING (DÙNG THANH GHI) ---
+    // TÍNH TOÁN POOLING
     // Base index để tính chỉ số Max (cho Backward)
     int base_idx_global = img_offset + h_in * W_in + w_in; 
 
@@ -85,7 +81,7 @@ __global__ void k_maxpool_fwd_2out_vec4(
     indices[out_global_idx + 1] = (float)(base_idx_global + midx2);
 }
 
-// KERNEL FALLBACK & BACKWARD (GIỮ NGUYÊN)
+// KERNEL FALLBACK & BACKWARD 
 __global__ void k_maxpool_fwd_scalar(
     const float* in, float* out, float* indices,
     int C, int H, int W, int H_out, int W_out, int k, int s) 
@@ -177,9 +173,6 @@ __global__ void k_maxpool_bwd_gather_opt(
 }
 } // namespace
 
-// ======================================================================
-// CLASS IMPLEMENTATION
-// ======================================================================
 
 MaxPool2D::MaxPool2D(int k, int s) : kernel_size(k), stride(s) {}
 

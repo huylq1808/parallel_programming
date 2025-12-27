@@ -5,7 +5,6 @@
 
 namespace {
 
-// --- FORWARD (Keep your optimized version) ---
 __global__ void k_conv2d_fwd_opt(
     const float* __restrict__ in, 
     const float* __restrict__ k, 
@@ -52,7 +51,6 @@ __global__ void k_conv2d_fwd_opt(
     out[out_global_idx] = sum;
 }
 
-// --- NEW: OPTIMIZED BIAS GRADIENT (REDUCTION) ---
 // Eliminates atomic contention on bias
 __global__ void k_conv2d_bwd_bias(
     const float* __restrict__ grad_out, 
@@ -88,7 +86,6 @@ __global__ void k_conv2d_bwd_bias(
     }
 }
 
-// --- OPTIMIZED BACKWARD (WEIGHTS & INPUT) ---
 // Removed Bias calculation to separate kernel
 __global__ void k_conv2d_bwd_data_weights(
     const float* __restrict__ in, 
@@ -148,9 +145,6 @@ __global__ void k_conv2d_bwd_data_weights(
 }
 } // namespace
 
-// ======================================================================
-// IMPLEMENTATION
-// ======================================================================
 
 Conv2D::Conv2D(int in, int out, int k, int s, int p) 
     : in_c(in), out_c(out), k_size(k), stride(s), padding(p) 

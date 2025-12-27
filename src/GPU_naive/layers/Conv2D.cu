@@ -3,9 +3,6 @@
 #include "core/Tensor.h"
 #include <cuda_runtime.h>
 
-// ======================================================================
-// 1. KERNELS (Internal)
-// ======================================================================
 namespace {
 
 __global__ void k_conv2d_fwd(const float* in, const float* k, const float* b, float* out,
@@ -82,10 +79,6 @@ __global__ void k_conv2d_bwd(const float* in, const float* k, const float* grad_
 }
 
 } // namespace
-
-// ======================================================================
-// 2. IMPLEMENTATION
-// ======================================================================
 
 Conv2D::Conv2D(int in, int out, int k, int s, int p) 
     : in_c(in), out_c(out), k_size(k), stride(s), padding(p) 
